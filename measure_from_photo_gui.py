@@ -40,11 +40,11 @@ YARDIMCI CIZGILER (istege bagli, perspektifi iyilestirir):
   secmek perspektif hesabini iyilestirir. Kenar A/B/C ile AYNI yuzeyde
   olmali (zemin, yan duvar, balkon onu, pencere girintisi DEGIL).
 
-  - Nokta ekledikten sonra kucuk bir pencere sorar: Hayir (Enter) /
-    AB yonu / AC yonu / Otomatik / Yonu daha sonra belirle. Ardindan
-    "Bu noktadan baslat" (nokta kenarin bir ucu olur) ya da "Baska
-    kenar sec" (fotografin herhangi bir yerinde iki uc). Istemiyorsaniz
-    arac cubugundaki "Noktadan sonra yardimci cizgi oner" kutusunu kapatin.
+  - Bir sonraki noktayi koyarken son noktadan fareye GECICI bir kilavuz
+    cizgi gorunur (gercek bir kenarla hizalamak icin); kaydedilmez ve
+    hesaba girmez. Arac cubugundaki "Kilavuz cizgi" kutusuyla kapatilir.
+  - Kalici yardimci cizgiler SADECE "Daha Yuksek Dogruluk" bolumundeki
+    "Yeni kenar sec" dugmeleriyle (ya da eski nokta-cifti secimiyle) eklenir.
   - Yakalama sirasinda Esc ya da sag tik (surukleme olmadan) iptal eder.
   - "Kenara oturt" acikken cizgi gercek goruntu kenarina subpixel
     hassasiyetle oturtulur (dusuk kontrastli/belirsiz kenarda zorlanmaz).
@@ -4278,9 +4278,11 @@ class MeasureApp(tk.Tk):
         self.magnifier_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(toolbar, text="Buyutecli Nokta Ekleme", variable=self.magnifier_var).pack(
             side="left", padx=(12, 0))
-        self.helper_prompt_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(toolbar, text="Noktadan sonra yardimci cizgi oner",
-                        variable=self.helper_prompt_var).pack(side="left", padx=(12, 0))
+        # Kilavuz cizgi: bir sonraki noktayi koyarken son noktadan fareye
+        # uzanan GECICI cizgi - hicbir yere kaydedilmez, nokta konunca kaybolur.
+        self.guide_line_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(toolbar, text="Kilavuz cizgi", variable=self.guide_line_var,
+                        command=lambda: self.canvas.delete("guide_line")).pack(side="left", padx=(12, 0))
         self.status_var = tk.StringVar(value="Once bir fotograf acin.")
         ttk.Label(toolbar, textvariable=self.status_var, foreground="#555").pack(side="left", padx=12)
 
@@ -5222,14 +5224,40 @@ class MeasureApp(tk.Tk):
         """Yardimci cizginin ilk ucu secildiyse, fareye kadar uzanan gecici
         bir onizleme cizgisi (tuval ogesi - tam yeniden cizim yapmadan)."""
         self.canvas.delete("helper_rubber")
+        self.canvas.delete("guide_line")
         cap = self.helper_capture
-        if cap is None or len(cap["points"]) != 1:
+        if cap is None:
+            self._draw_guide_line(event)
+            return
+        if len(cap["points"]) != 1:
             return
         x0 = (cap["points"][0][0] - self.view_x) * self.view_scale
         y0 = (cap["points"][0][1] - self.view_y) * self.view_scale
         color = "#%02x%02x%02x" % HELPER_COLORS.get(cap["family"], HELPER_COLORS["auto"])
         self.canvas.create_line(x0, y0, event.x, event.y, fill=color, width=2, dash=(6, 4),
                                 tags="helper_rubber")
+
+    def _draw_guide_line(self, event):
+        """Son eklenen noktadan fareye kadar kesikli kilavuz, fare yonunde
+        tuvalin kenarina kadar soluk uzanti (gercek bir kenarla hizalamak
+        icin). Sadece tuval ogesi - veri modeline/hesaba girmez."""
+        if (self.pil_img is None or not self.points or not self.guide_line_var.get()
+                or self.edge_mode or self.line_calib_mode):
+            return
+        last = self.points[-1]
+        x0 = (last["x"] - self.view_x) * self.view_scale
+        y0 = (last["y"] - self.view_y) * self.view_scale
+        dx, dy = event.x - x0, event.y - y0
+        d = math.hypot(dx, dy)
+        if d < 3:
+            return
+        cw, ch = self._canvas_size()
+        reach = 2.0 * math.hypot(cw, ch)
+        ex, ey = x0 + dx / d * reach, y0 + dy / d * reach
+        self.canvas.create_line(event.x, event.y, ex, ey, fill="#00e5ff", width=1, dash=(2, 6),
+                                tags="guide_line")
+        self.canvas.create_line(x0, y0, event.x, event.y, fill="#00e5ff", width=2, dash=(8, 4),
+                                tags="guide_line")
 
     def _canvas_to_image(self, cx, cy):
         return self.view_x + cx / self.view_scale, self.view_y + cy / self.view_scale
@@ -5535,8 +5563,6 @@ class MeasureApp(tk.Tk):
         self._redraw()
         self._refresh_all_display()
         self.status_var.set(f"'{label}' eklendi. Toplam {len(self.points)} nokta.")
-        if self.helper_prompt_var.get():
-            self.after_idle(lambda: self._offer_helper_after_point(label))
 
     # ---------- Buyutecli hassas nokta yerlestirme ----------
     # SimpleMeasure gibi profesyonel olcum yazilimlarinda goruldugu uzere:
@@ -5708,61 +5734,6 @@ class MeasureApp(tk.Tk):
         win.grab_set()
         self.wait_window(win)
         return result["key"]
-
-    def _point_role(self, label):
-        """Etiketin referanstaki rolu (A/B/C) - comboboxlardan, yoksa
-        (henuz secim yapilmamissa) varsayilan A/B/C etiketlerinden."""
-        combos = [cb.get() for cb in self.abc_combos]
-        for role, lb in zip("ABC", combos):
-            if lb == label:
-                return role
-        if not any(combos) and label in ("A", "B", "C"):
-            return label
-        return None
-
-    def _offer_helper_after_point(self, label):
-        """Nokta eklendikten SONRA hafif, ISTEGE BAGLI soru. Enter/Hayir ile
-        akis eskisi gibi devam eder."""
-        if self.pil_img is None or self.helper_capture is not None:
-            return
-        if not any(p["label"] == label for p in self.points):
-            return
-        role = self._point_role(label)
-        rec = {"B": "ab", "C": "ac"}.get(role)
-        hint = ""
-        if role == "A":
-            hint = ("\n\nA ortak kosedir - hem AB hem AC yonune katilir. Hangi yonde bir kenar "
-                    "ekleyeceginizi acikca secin.")
-        elif rec:
-            hint = (f"\n\n{label} ile {FAMILY_NAMES[rec]} referans kenari tanimlandi; bu yonde baska bir "
-                    f"kenar eklemek en dogal secimdir (kenar baska bir yerde de olabilir).")
-        buttons = [("no", "Hayir"),
-                   ("ab", "AB yonu" + (" (onerilen)" if rec == "ab" else "")),
-                   ("ac", "AC yonu" + (" (onerilen)" if rec == "ac" else "")),
-                   ("auto", "Otomatik"),
-                   ("later", "Yonu daha sonra belirle")]
-        choice = self._choice_dialog(
-            "Yardimci cizgi ekle?",
-            f"'{label}' eklendi. Bu nokta icin yardimci cizgi eklemek ister misiniz?\n\n"
-            f"Yardimci cizgi, A-B veya A-C ile gercekte paralel olan baska bir kenardir. "
-            f"Istemiyorsaniz Enter (Hayir) ile devam edin.{hint}",
-            buttons, default="no")
-        if choice in (None, "no"):
-            return
-        mode = self._choice_dialog(
-            "Yardimci cizgi",
-            f"Kenari nasil secmek istersiniz?\n\n"
-            f"Bu noktadan baslat: '{label}' kenarin bir ucu olur; ayni gercek kenar uzerinde "
-            f"ikinci bir nokta tiklayin.\n\n"
-            f"Baska kenar sec: fotografin herhangi bir yerindeki bir kenarin iki ucunu tiklayin "
-            f"(en faydalisi: referanstan UZAK, uzun ve net bir kenar).",
-            [("anchor", "Bu noktadan baslat"), ("free", "Baska kenar sec"), ("cancel", "Iptal")],
-            default="anchor")
-        if mode in (None, "cancel"):
-            return
-        family = "auto" if choice in ("auto", "later") else choice
-        self.start_helper_capture(family, anchor_label=label if mode == "anchor" else None,
-                                  defer_family=(choice == "later"))
 
     def start_helper_capture(self, family, anchor_label=None, defer_family=False):
         if self.pil_img is None:

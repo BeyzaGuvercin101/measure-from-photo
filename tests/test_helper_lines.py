@@ -289,7 +289,6 @@ def app(tmp_path_factory):
     except Exception as e:  # ekran yok
         pytest.skip(f"Tk acilamadi: {e}")
     a.withdraw()
-    a.helper_prompt_var.set(False)
     a.magnifier_var.set(False)
     a._answers = []
     a._choice_dialog = lambda title, text, buttons, default=None: a._answers.pop(0) if a._answers else default
@@ -416,4 +415,23 @@ def test_app_json_roundtrip_and_old_config(app, tmp_path):
     json.dump({"photo_path": app._img_path, "image_points": pts, "queries": []}, open(p3, "w"))
     m.filedialog.askopenfilename = lambda **k: p3
     app.load_config()
+    assert app.helper_lines == []
+
+
+def test_app_point_creation_creates_no_helper_line(app):
+    """Nokta eklemek kalici bir yardimci cizgi OLUSTURMAZ ve soru sormaz;
+    kilavuz cizgi sadece tuval ogesidir."""
+    _setup_reference(app)
+    opened = []
+    app._choice_dialog = lambda *a, **k: opened.append(a) or k.get("default")
+    m.simpledialog.askstring = lambda *a, **k: "Z"
+    app._finish_adding_point(300.0, 300.0)
+    app.update()
+    assert any(p["label"] == "Z" for p in app.points)
+    assert app.helper_lines == [] and not opened
+
+    class Ev:
+        x, y = 400, 350
+    app._on_canvas_motion(Ev())
+    assert app.canvas.find_withtag("guide_line")
     assert app.helper_lines == []

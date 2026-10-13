@@ -19,8 +19,9 @@ Yardımcı çizgi, A-B veya A-C ile gerçekte paralel olan başka bir kenardır
 (aynı yüzeyde). Fotoğrafın farklı bir bölgesindeki uzun ve net bir kenar
 perspektif (kaçış noktası) hesabını iyileştirir; ölçek her zaman A/B/C'den gelir.
 
-- Nokta ekledikten sonra isteğe bağlı olarak sorulur (Hayır / AB / AC /
-  Otomatik / Daha sonra), ardından "Bu noktadan başlat" ya da "Başka kenar seç".
+- Nokta koyarken son noktadan fareye geçici bir kılavuz çizgi görünür
+  (kaydedilmez, hesaba girmez; "Kılavuz çizgi" kutusuyla kapatılır).
+- Kalıcı yardımcı çizgiler yalnızca "Daha Yüksek Doğruluk" bölümünden eklenir.
 - Yardımcı çizgiler noktalardan ayrı saklanır (sahte ölçüm noktası oluşturmaz).
 - Her yeni çizgi için önce/sonra karşılaştırması yapılır; mevcut kanıtla
   çelişen bir çizgi modeli otomatik değiştirmez (Tut / Yönü değiştir / Sil).
