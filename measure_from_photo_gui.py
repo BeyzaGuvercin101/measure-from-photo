@@ -33,6 +33,28 @@ REFERANS OLUSTURMA (sag panelde tek akis - "Referans Olustur"):
   (Eski afin/4-kose/N-nokta hesaplama yollari kod icinde regresyon
   testleri icin korunuyor ama kullanici arayuzunde gosterilmiyor.)
 
+YARDIMCI CIZGILER (istege bagli, perspektifi iyilestirir):
+
+  Yardimci cizgi, A-B veya A-C ile gercekte paralel olan baska bir
+  kenardir. Fotografin farkli bir bolgesindeki uzun ve net bir kenar
+  secmek perspektif hesabini iyilestirir. Kenar A/B/C ile AYNI yuzeyde
+  olmali (zemin, yan duvar, balkon onu, pencere girintisi DEGIL).
+
+  - Nokta ekledikten sonra kucuk bir pencere sorar: Hayir (Enter) /
+    AB yonu / AC yonu / Otomatik / Yonu daha sonra belirle. Ardindan
+    "Bu noktadan baslat" (nokta kenarin bir ucu olur) ya da "Baska
+    kenar sec" (fotografin herhangi bir yerinde iki uc). Istemiyorsaniz
+    arac cubugundaki "Noktadan sonra yardimci cizgi oner" kutusunu kapatin.
+  - Yakalama sirasinda Esc ya da sag tik (surukleme olmadan) iptal eder.
+  - "Kenara oturt" acikken cizgi gercek goruntu kenarina subpixel
+    hassasiyetle oturtulur (dusuk kontrastli/belirsiz kenarda zorlanmaz).
+  - Her yeni cizgi icin once/sonra karsilastirmasi gosterilir (yon
+    belirsizligi, bagimsiz kalinti, uzamsal kapsama). Cizgi mevcut
+    kanitla celisiyorsa model OTOMATIK degismez; Tut / Yonu degistir /
+    Sil secersiniz.
+  - "Daha Yuksek Dogruluk" listesinde tum yardimci cizgiler (eski
+    nokta-cifti secimleri dahil) gorunur: sil, AB/AC yap, yon oner.
+
 Not: Olcum, sorgu noktalarinin referans yuzeyle AYNI DUZLEMDE (es-
 duzlemsel) oldugunu varsayar - farkli bir yuzeydeki (ornek: cati disina
 cikan bir dormer) bir uzunluk icin o yuzeyin kendi referans
@@ -76,6 +98,7 @@ Bagimliliklar: pip install pillow numpy opencv-python
 import json
 import math
 import os
+from dataclasses import dataclass, field
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog, scrolledtext
 
@@ -136,6 +159,22 @@ GRID_COLOR = (255, 215, 0)
 PREVIEW_GRID_COLOR = (255, 170, 40)
 LINE_CALIB_COLOR = (0, 200, 255)
 LINE_CALIB_ACTIVE_COLOR = (255, 0, 220)
+# Yardimci cizgiler KESIKLI cizilir (referans/sorgu/lens/kenar cizgileri
+# duz cizilir) ve aileye gore renklenir.
+HELPER_COLORS = {"ab": (40, 120, 255), "ac": (190, 80, 255), "auto": (190, 190, 190)}
+HELPER_WARN_COLOR = (255, 60, 60)
+
+
+def _draw_dashed_line(draw, p, q, fill, width=2, dash=10, gap=6):
+    L = math.hypot(q[0] - p[0], q[1] - p[1])
+    if L < 1e-6:
+        return
+    ux, uy = (q[0] - p[0]) / L, (q[1] - p[1]) / L
+    t = 0.0
+    while t < L:
+        t2 = min(L, t + dash)
+        draw.line([(p[0] + ux * t, p[1] + uy * t), (p[0] + ux * t2, p[1] + uy * t2)], fill=fill, width=width)
+        t = t2 + gap
 
 UNITS = {"m": 1.0, "cm": 0.01, "mm": 0.001, "ft": 0.3048, "inc": 0.0254}
 
@@ -1456,32 +1495,11 @@ def compute_metric_homography_stratified(A, B, C, ab_m, ac_m, angle_deg,
     if v_ab_hom is None or v_ac_hom is None:
         return None
 
-    l_inf = estimate_vanishing_line(v_ab_hom, v_ac_hom)
-    if l_inf is None:
+    core = _stratified_metric_from_vps(A, B, C, ab_m, ac_m, angle_deg, v_ab_hom, v_ac_hom)
+    if core is None:
         return None
-    H_p = affine_rectification_from_vanishing_line(l_inf)
-
-    try:
-        A_r = apply_transform(H_p, A)
-        B_r = apply_transform(H_p, B)
-        C_r = apply_transform(H_p, C)
-    except ValueError:
-        return None
-
-    try:
-        T_metric = fit_affine([A_r, B_r, C_r], [world_A, world_B, world_C])
-        H_final = T_metric @ H_p
-    except (ValueError, np.linalg.LinAlgError):
-        return None
-    if abs(H_final[2, 2]) < 1e-12:
-        return None
-    H_final = H_final / H_final[2, 2]
-
-    try:
-        Hinv_final = np.linalg.inv(H_final)
-        D_img = apply_transform(Hinv_final, world_D)
-    except (np.linalg.LinAlgError, ValueError):
-        return None
+    H_p, l_inf = core["H_p"], core["l_inf"]
+    H_final, Hinv_final, D_img = core["H"], core["Hinv"], core["D_img"]
 
     # BOLUM 32/33 TESHIS: iki asamayi AYRI AYRI dogrula - hangisi
     # basarisiz olursa hatanin KAYNAGINI (VP/rektifikasyon mu, yoksa
@@ -1518,6 +1536,1050 @@ def compute_metric_homography_stratified(A, B, C, ab_m, ac_m, angle_deg,
         "angle_recovered_deg": angle_recovered_deg, "angle_input_deg": angle_deg,
         "ref_scale": ref_scale,
     }
+
+
+def _stratified_metric_from_vps(A, B, C, ab_m, ac_m, angle_deg, v_ab_hom, v_ac_hom,
+                                require_same_side=False):
+    """Kademeli rektifikasyonun ORTAK cekirdegi: verilen iki HOMOJEN kacis
+    yonunden (v_AB, v_AC) l_inf = v_AB x v_AC -> H_p (projektif->afin) ->
+    T_metric (A,B,C'den TAM afin, metrik) -> H_final; D* SADECE bundan SONRA
+    turetilir (D_world = B_world + C_world, D_img = H_final^-1 * D_world).
+
+    require_same_side=True ise A, B, C'nin kacis cizgisinin AYNI tarafinda
+    olmasi sart kosulur - aksi halde (referans ufkun iki yanina dusuyorsa)
+    VP tahmini fiziksel olarak imkansiz bir duzlem tanimlar."""
+    angle_rad = math.radians(angle_deg)
+    world_A = (0.0, 0.0)
+    world_B = (ab_m, 0.0)
+    world_C = (ac_m * math.cos(angle_rad), ac_m * math.sin(angle_rad))
+    world_D = (world_B[0] + world_C[0], world_B[1] + world_C[1])
+
+    l_inf = estimate_vanishing_line(v_ab_hom, v_ac_hom)
+    if l_inf is None:
+        return None
+    if require_same_side:
+        sides = [float(l_inf @ np.array([p[0], p[1], 1.0])) for p in (A, B, C)]
+        if not (all(s > 0 for s in sides) or all(s < 0 for s in sides)):
+            return None
+    H_p = affine_rectification_from_vanishing_line(l_inf)
+    try:
+        A_r = apply_transform(H_p, A)
+        B_r = apply_transform(H_p, B)
+        C_r = apply_transform(H_p, C)
+        T_metric = fit_affine([A_r, B_r, C_r], [world_A, world_B, world_C])
+    except (ValueError, np.linalg.LinAlgError):
+        return None
+    H_final = T_metric @ H_p
+    if abs(H_final[2, 2]) < 1e-12:
+        return None
+    H_final = H_final / H_final[2, 2]
+    try:
+        Hinv_final = np.linalg.inv(H_final)
+        D_img = apply_transform(Hinv_final, world_D)
+    except (np.linalg.LinAlgError, ValueError):
+        return None
+    return {"H": H_final, "Hinv": Hinv_final, "D_img": D_img, "H_p": H_p, "l_inf": l_inf,
+            "world_A": world_A, "world_B": world_B, "world_C": world_C, "world_D": world_D}
+
+
+# =======================================================================
+# YARDIMCI CIZGI GOZLEMLERI + OLCUM-BELIRSIZLIGI AGIRLIKLI SAGLAM KACIS
+# NOKTASI (VP) TAHMINI, BAGIMSIZ DOGRULAMA VE MODEL KARSILASTIRMA
+#
+# Her cizgi (referans AB/AC, kullanicinin yardimci cizgileri, otomatik
+# LSD/Hough cizgileri, olcum-sorgusu kenarlari) bir LineObservation olur.
+# Her gozlemin ACISAL belirsizligi (sigma_theta) uzunluk, uc-nokta
+# hassasiyeti, destek pikseli sayisi ve kaynaktan (dogrulanmis mi) turetilir:
+#
+#     w_measurement = 1 / sigma_theta^2
+#     w_effective   = w_measurement * w_robust      (Tukey IRLS)
+#
+# Kullanici-dogrulamali cizgiler (referans + elle yardimci cizgiler) VP
+# hipotezleri icin SERT bir kisit olusturur (referans HER ZAMAN inlier
+# kalmali; >=3 dogrulanmis cizgi varsa en fazla n//3'u aykiri olabilir -
+# boylece yanlis bir yardimci cizgi TESPIT edilebilir). Dogrulanmamis
+# (otomatik) cizgiler MSAC ile oy kullanir; ailesi YEREL ACIYA gore degil,
+# VP tutarliligina gore belirlenir.
+# =======================================================================
+
+# Uc-nokta (veya kenar-ornegi) basina dik yondeki piksel belirsizligi (1-sigma).
+LINE_ENDPOINT_SIGMA_PX = {
+    "manual": 1.0,            # tek tiklama
+    "manual_magnifier": 0.5,  # buyutecle hassaslastirilmis tiklama
+    "auto": 0.7,              # LSD/Hough (tespit olcegine gore buyutulur)
+}
+# Model/yapi belirsizligi (eklenen varyans tabani): gercek kenarlar mukemmel
+# duz degildir, otomatik cizgiler ise ayrica farkli bir yapi elemanina
+# (pencere girintisi, hafif lens egriligi) ait olabilir. Bu bir TABAN
+# belirsizliktir, fotografa ozel bir duzeltme DEGILDIR.
+LINE_MODEL_SIGMA_DEG_VERIFIED = 0.05
+LINE_MODEL_SIGMA_DEG_UNVERIFIED = 0.25
+# Otomatik cizgilerin ORTAK (korelasyonlu) aci hatasi - cok sayida cizgiyle
+# ortalanarak kuculmez; belirsizlik tahmininde (MC) ayrica modellenir.
+LINE_COMMON_SIGMA_DEG_UNVERIFIED = 0.15
+VP_GATE_Z = 3.0               # normalize aci kalintisi (theta/sigma) icin 3-sigma kapisi
+VP_TUKEY_C = 4.685            # Tukey biweight sabiti (%95 Gauss verimliligi)
+VP_MAX_HYPOTHESES = 600
+AUTO_LINE_POOL_MAX = 150
+AMBIGUITY_GAP_CHI2 = 9.0      # rakip VP hipotezi en iyiden < 9 (ki-kare) uzaktaysa 'belirsiz'
+AMBIGUITY_MIN_AUTO = 5        # yardimcisiz bir ailede bundan az otomatik inlier + belirsizlik -> kullanma
+CONF_SCALE_UNC_HIGH = 0.01    # uzak bolgede 1-sigma goreli olcek belirsizligi <= %1 -> YUKSEK adayi
+CONF_SCALE_UNC_MID = 0.03     # <= %3 -> ORTA adayi
+
+
+def line_angle_sigma_deg(length_px, endpoint_sigma_px, n_support=2, verified=True):
+    """Bir dogru parcasinin YON (aci) belirsizligi, derece (1-sigma).
+
+    - Sadece iki uc noktasiyla tanimli cizgi (n_support<=2): her ucun dik
+      hatasi sigma_e ise sigma_theta ~ sqrt(2)*sigma_e/L (radyan).
+    - Kenar boyunca n_support ornekle TLS ile fit edilmis cizgi: egim
+      varyansi sigma_e^2 / sum(t_i^2) ~ 12*sigma_e^2/(n*L^2).
+    Sonuca (karesel toplamla) kaynak tipine bagli model-belirsizligi tabani
+    eklenir. Uzun cizgi daha kucuk sigma alir, ama ASLA sifira inmez -
+    'uzun cizgi = otomatik olarak dogru cizgi' DEGILDIR (bkz. Bolum 13)."""
+    L = max(float(length_px), 1.0)
+    se = max(float(endpoint_sigma_px), 1e-3)
+    if n_support is None or n_support <= 2:
+        s_rad = math.sqrt(2.0) * se / L
+    else:
+        s_rad = se * math.sqrt(12.0 / float(n_support)) / L
+    model = LINE_MODEL_SIGMA_DEG_VERIFIED if verified else LINE_MODEL_SIGMA_DEG_UNVERIFIED
+    return math.hypot(math.degrees(s_rad), model)
+
+
+@dataclass
+class LineObservation:
+    """Tek bir GEOMETRIK gozlem (kontrol noktasi/olcum noktasi DEGIL)."""
+    p1: tuple
+    p2: tuple
+    source: str = "manual"
+    verified: bool = True
+    family: str = "auto"
+    line_id: str = ""
+    is_reference: bool = False
+    endpoint_sigma_px: float = 1.0
+    n_support: int = 2
+    gradient_strength: float = None
+    homogeneous_line: np.ndarray = field(init=False, repr=False)
+    length_px: float = field(init=False)
+    midpoint: tuple = field(init=False)
+    angle_deg: float = field(init=False)
+    sigma_angle_deg: float = field(init=False)
+
+    def __post_init__(self):
+        x1, y1 = float(self.p1[0]), float(self.p1[1])
+        x2, y2 = float(self.p2[0]), float(self.p2[1])
+        self.p1, self.p2 = (x1, y1), (x2, y2)
+        l = np.cross([x1, y1, 1.0], [x2, y2, 1.0])
+        n = math.hypot(l[0], l[1])
+        self.homogeneous_line = l / n if n > 1e-12 else l
+        self.length_px = math.hypot(x2 - x1, y2 - y1)
+        self.midpoint = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+        self.angle_deg = math.degrees(math.atan2(y2 - y1, x2 - x1)) % 180.0
+        self.sigma_angle_deg = line_angle_sigma_deg(self.length_px, self.endpoint_sigma_px,
+                                                    self.n_support, self.verified)
+
+
+def _obs_arrays(obs):
+    L = np.array([o.homogeneous_line for o in obs], dtype=np.float64).reshape(-1, 3)
+    M = np.array([o.midpoint for o in obs], dtype=np.float64).reshape(-1, 2)
+    S = np.array([o.sigma_angle_deg for o in obs], dtype=np.float64)
+    return L, M, S
+
+
+def vp_angular_residuals_deg(L, M, v):
+    """Vektorize, HOMOJEN aci kalintisi: her cizgi ile, cizginin orta
+    noktasindan v'ye giden yon arasindaki aci (derece). (a,b)-birim
+    normalize cizgi l ve birim v icin sin(theta) = |l.v| / D,
+    D = ||(vx - mx*vz, vy - my*vz)||. v sonsuzda (vz=0) ise de AYNI formul
+    gecerlidir (D = ||(vx,vy)||) - near_infinity ozel durumu gerekmez."""
+    v = np.asarray(v, dtype=np.float64)
+    num = np.abs(L @ v)
+    D = np.hypot(v[0] - M[:, 0] * v[2], v[1] - M[:, 1] * v[2])
+    s = np.where(D > 1e-12, num / np.maximum(D, 1e-300), 1.0)
+    return np.degrees(np.arcsin(np.clip(s, 0.0, 1.0)))
+
+
+def vp_direction_angle_at(v, pt):
+    """pt noktasindan (homojen) v'ye giden yonun acisi, [0, pi)."""
+    dx = v[0] - pt[0] * v[2]
+    dy = v[1] - pt[1] * v[2]
+    return math.atan2(dy, dx) % math.pi
+
+
+def _circular_std_deg_pi(angles_rad):
+    """pi-periyodik (yonsuz) acilarin dairesel standart sapmasi, derece."""
+    two = 2.0 * np.asarray(angles_rad, dtype=np.float64)
+    R = min(max(math.hypot(float(np.mean(np.cos(two))), float(np.mean(np.sin(two)))), 1e-12), 1.0)
+    return math.degrees(math.sqrt(-2.0 * math.log(R)) / 2.0)
+
+
+def _conditioning_transform(M):
+    c = M.mean(axis=0)
+    d = float(np.hypot(M[:, 0] - c[0], M[:, 1] - c[1]).mean())
+    s = math.sqrt(2.0) / d if d > 1e-9 else 1.0
+    return np.array([[s, 0.0, -s * c[0]], [0.0, s, -s * c[1]], [0.0, 0.0, 1.0]])
+
+
+def fit_vp_weighted(L, M, w, v_init=None, n_iter=3):
+    """Agirlikli HOMOJEN en kucuk kareler VP fit'i (Hartley-tarzi
+    kosullandirilmis koordinatlarda). Minimize edilen:
+
+        sum_i w_i * sin^2(theta_i) = sum_i w_i * (l_i.v)^2 / D_i(v)^2
+
+    D_i bir onceki iterasyondan alinir (IRLS). Boylece kalinti PIKSEL
+    mesafesi degil ACI'dir (VP ne kadar uzakta olursa olsun olcek-bagimsiz)
+    ve her cizgi KENDI acisal belirsizligiyle (w_i = 1/sigma_i^2)
+    agirliklandirilir. Sonuc birim-norm homojen 3-vektor (sonsuz VP gecerli)."""
+    L = np.asarray(L, dtype=np.float64).reshape(-1, 3)
+    M = np.asarray(M, dtype=np.float64).reshape(-1, 2)
+    w = np.asarray(w, dtype=np.float64).reshape(-1)
+    mask = w > 0
+    if mask.sum() < 2:
+        return None
+    L, M, w = L[mask], M[mask], w[mask]
+    T = _conditioning_transform(M)
+    Tinv = np.linalg.inv(T)
+    Ln = L @ Tinv
+    nn = np.hypot(Ln[:, 0], Ln[:, 1])
+    if np.any(nn < 1e-15):
+        return None
+    Ln = Ln / nn[:, None]
+    Mn = M @ T[:2, :2].T + T[:2, 2]
+    v = None
+    if v_init is not None:
+        v = T @ np.asarray(v_init, dtype=np.float64)
+        v = v / np.linalg.norm(v)
+    for _ in range(max(1, n_iter)):
+        if v is None:
+            W = w.copy()
+        else:
+            D = np.hypot(v[0] - Mn[:, 0] * v[2], v[1] - Mn[:, 1] * v[2])
+            D = np.maximum(D, 1e-6 * max(float(D.max()), 1e-12))
+            W = w / D ** 2
+        W = W / W.max()
+        Amat = (Ln * W[:, None]).T @ Ln
+        _evals, evecs = np.linalg.eigh(Amat)
+        v = evecs[:, 0]
+    out = Tinv @ v
+    nrm = np.linalg.norm(out)
+    if nrm < 1e-15:
+        return None
+    return out / nrm
+
+
+def _tukey_weights(z, c=VP_TUKEY_C):
+    r = np.asarray(z, dtype=np.float64) / c
+    return np.where(r < 1.0, (1.0 - r * r) ** 2, 0.0)
+
+
+def estimate_vp_weighted(obs, gate_z=VP_GATE_Z, max_hypotheses=VP_MAX_HYPOTHESES, seed=0, min_inliers=2):
+    """Bir cizgi ailesi icin saglam, belirsizlik-agirlikli VP kestirimi.
+
+    1) Hipotezler: dogrulanmis cizgi ciftleri + (dogrulanmis x otomatik)
+       ciftleri (+ dogrulanmis cizgi yoksa rastgele ciftler).
+    2) Her hipotez kapi-tabanli inlier secimi + agirlikli homojen fit ile
+       yerel olarak inceltilir.
+    3) Kisitlar: referans cizgisi inlier OLMALI; dogrulanmis aykiri sayisi
+       <= (0 eger n_dogrulanmis<=2, aksi halde n//3).
+    4) MSAC skoru: sum min(z^2, gate^2), z = theta/sigma.
+    5) En iyi hipotezden Tukey-IRLS ile son inceltme.
+    VP sonsuzda olabilir (vz~0) - gecerli bir sonuctur, None'a cevrilmez.
+
+    Doner: sozluk (v, inliers, z, theta_deg, w_meas, w_robust, w_eff,
+    verified_outliers, chi2_red, n_inliers, cost, n_hypotheses) ya da None."""
+    n = len(obs)
+    if n < 2:
+        return None
+    L, M, S = _obs_arrays(obs)
+    if np.any(np.hypot(L[:, 0], L[:, 1]) < 1e-12):
+        return None
+    w_meas = 1.0 / S ** 2
+    ver = np.array([bool(o.verified) for o in obs])
+    ref = np.array([bool(o.is_reference) for o in obs])
+    ver_idx = np.flatnonzero(ver)
+    oth_idx = np.flatnonzero(~ver)
+    n_v = len(ver_idx)
+    allowed_out = 0 if n_v <= 2 else n_v // 3
+    rng = np.random.default_rng(seed)
+
+    pairs = [(int(i), int(j)) for a, i in enumerate(ver_idx) for j in ver_idx[a + 1:]]
+    mixed = [(int(i), int(j)) for i in ver_idx for j in oth_idx]
+    budget = max_hypotheses - len(pairs)
+    if budget <= 0:
+        mixed = []
+    elif len(mixed) > budget:
+        sel = rng.choice(len(mixed), size=budget, replace=False)
+        mixed = [mixed[k] for k in sorted(sel)]
+    pairs += mixed
+    if n_v == 0 or len(pairs) < 20:
+        n_rand = min(max(0, max_hypotheses - len(pairs)), n * (n - 1) // 2)
+        for _ in range(n_rand):
+            i, j = rng.choice(n, size=2, replace=False)
+            pairs.append((int(i), int(j)))
+
+    def admissible(z):
+        if ref.any() and np.any(z[ref] > gate_z):
+            return False
+        if int(np.sum(z[ver] > gate_z)) > allowed_out:
+            return False
+        return int(np.sum(z <= gate_z)) >= min_inliers
+
+    def refine(v):
+        inl = None
+        for _ in range(4):
+            z = vp_angular_residuals_deg(L, M, v) / S
+            new_inl = z <= gate_z
+            if inl is not None and np.array_equal(new_inl, inl):
+                break
+            inl = new_inl
+            if inl.sum() < 2:
+                break
+            v2 = fit_vp_weighted(L[inl], M[inl], w_meas[inl], v_init=v, n_iter=2)
+            if v2 is None:
+                break
+            if admissible(z) and not admissible(vp_angular_residuals_deg(L, M, v2) / S):
+                # Cok sayida (ör. sistematik yanli) dogrulanmamis cizgi fit'i
+                # dogrulanmis cizgilerin kapisinin DISINA cekti. Dogrulanmis
+                # cizgiler sert kisittir: kisit saglanana kadar dogrulanmamis
+                # cizgilerin agirligi yarilanir.
+                ww = w_meas[inl].copy()
+                unv_in = ~ver[inl]
+                for _k in range(10):
+                    ww[unv_in] *= 0.5
+                    v3 = fit_vp_weighted(L[inl], M[inl], ww, v_init=v, n_iter=2)
+                    if v3 is not None and admissible(vp_angular_residuals_deg(L, M, v3) / S):
+                        v2 = v3
+                        break
+                else:
+                    break
+            v = v2
+        return v, vp_angular_residuals_deg(L, M, v) / S
+
+    best_cost, best_v = None, None
+    admitted = []
+    for i, j in pairs:
+        cand = np.cross(L[i], L[j])
+        cn = np.linalg.norm(cand)
+        if cn < 1e-12:
+            continue
+        v, z = refine(cand / cn)
+        if not admissible(z):
+            continue
+        cost = float(np.sum(np.minimum(z * z, gate_z ** 2)))
+        admitted.append((cost, v))
+        if best_cost is None or cost < best_cost - 1e-9:
+            best_cost, best_v = cost, v
+    if best_v is None:
+        return None
+
+    # HIPOTEZ BELIRSIZLIGI: en iyi hipotezden GEOMETRIK OLARAK belirgin
+    # bicimde farkli (herhangi bir cizgi orta noktasindan gorulen yon farki
+    # > 1°) ama MSAC maliyeti yakin bir rakip var mi? Ornek: goz hizasindaki
+    # bir referans kenari ufka yakin oldugunda, yan duvar/zemin cizgilerinin
+    # ortak VP'si de referans kisitini gecebilir. Inlier-kosullu belirsizlik
+    # (MC) bunu GOREMEZ; bu fark (ki-kare biriminde) gorur.
+    def _max_dir_diff_deg(v1, v2):
+        a1 = np.arctan2(v1[1] - M[:, 1] * v1[2], v1[0] - M[:, 0] * v1[2])
+        a2 = np.arctan2(v2[1] - M[:, 1] * v2[2], v2[0] - M[:, 0] * v2[2])
+        d = np.abs(a1 - a2) % np.pi
+        return float(np.degrees(np.max(np.minimum(d, np.pi - d))))
+    rival_gap = None
+    for cost, v in admitted:
+        if _max_dir_diff_deg(v, best_v) > 1.0:
+            gap = cost - best_cost
+            if rival_gap is None or gap < rival_gap:
+                rival_gap = gap
+
+    v = best_v
+    for _ in range(5):
+        z = vp_angular_residuals_deg(L, M, v) / S
+        v2 = fit_vp_weighted(L, M, w_meas * _tukey_weights(z), v_init=v, n_iter=2)
+        if v2 is None:
+            break
+        converged = abs(abs(float(v2 @ v)) - 1.0) < 1e-14
+        v = v2
+        if converged:
+            break
+    theta = vp_angular_residuals_deg(L, M, v)
+    z = theta / S
+    if not admissible(z):  # IRLS kisitlari bozduysa MSAC cozumune geri don
+        v = best_v
+        theta = vp_angular_residuals_deg(L, M, v)
+        z = theta / S
+    inl = z <= gate_z
+    wr = _tukey_weights(z)
+    n_in = int(inl.sum())
+    chi2_red = float(np.sum(z[inl] ** 2) / (n_in - 2)) if n_in > 2 else None
+    return {
+        "v": v / np.linalg.norm(v), "inliers": inl, "z": z, "theta_deg": theta,
+        "w_meas": w_meas, "w_robust": wr, "w_eff": w_meas * wr,
+        "verified_outliers": [int(k) for k in np.flatnonzero(ver & ~inl)],
+        "chi2_red": chi2_red, "n_inliers": n_in, "cost": best_cost, "n_hypotheses": len(pairs),
+        "rival_gap": rival_gap,
+    }
+
+
+def _perturbed_vp_samples(obs, v, n_mc, rng):
+    """Parametrik bootstrap: her cizgiyi KENDI belirsizligiyle (orta nokta
+    etrafinda aci ~ N(0, sigma_theta), dik kayma ~ N(0, sigma_e/sqrt(n)))
+    rastgele bozup VP'yi AYNI agirliklarla yeniden fit eder. Az cizgi (2-3)
+    varken de tanimlidir (yeniden-ornekleme bootstrap'i o durumda dejenere
+    olur)."""
+    L0, M, S = _obs_arrays(obs)
+    w = 1.0 / S ** 2
+    ang = np.radians(np.array([o.angle_deg for o in obs], dtype=np.float64))
+    shift_sig = np.array([o.endpoint_sigma_px / math.sqrt(max(2, o.n_support or 2)) for o in obs])
+    unver = np.array([not o.verified for o in obs])
+    out = []
+    for _ in range(n_mc):
+        # Dogrulanmamis (otomatik) cizgilerin hatasinin bir kismi ORTAKTIR
+        # (artik lens distorsiyonu, sistematik kenar kaymasi): N cizgi
+        # eklemek bu bileseni ortalamayla AZALTMAZ. Her ornekte tum
+        # otomatik cizgilere ayni ek donme uygulanir.
+        common = np.radians(rng.normal(0.0, LINE_COMMON_SIGMA_DEG_UNVERIFIED)) * unver
+        a = ang + np.radians(rng.normal(0.0, S)) + common
+        d = np.column_stack([np.cos(a), np.sin(a)])
+        nrm = np.column_stack([-d[:, 1], d[:, 0]])
+        m = M + nrm * rng.normal(0.0, shift_sig)[:, None]
+        Lk = np.column_stack([nrm, -(nrm * m).sum(axis=1)])
+        vk = fit_vp_weighted(Lk, m, w, v_init=v, n_iter=2)
+        if vk is not None:
+            out.append(vk)
+    return out
+
+
+def vp_direction_uncertainty_deg(obs, v, eval_points, n_mc=60, seed=0, chi2_red=None):
+    """VP'nin, verilen noktalardan GORULEN yon belirsizligi (derece, 1-sigma).
+    Sonlu/sonsuz VP icin aynen tanimli (Oklid VP piksel-STD'si sonsuza
+    yakin VP'lerde yaniltici olur). Gozlenen kalintilar beklenenden buyukse
+    (indirgenmis ki-kare > 1) belirsizlik sqrt(chi2_red) ile buyutulur -
+    standart kovaryans olcekleme."""
+    if len(obs) < 2:
+        return [None] * len(eval_points)
+    rng = np.random.default_rng(seed)
+    samples = _perturbed_vp_samples(obs, v, n_mc, rng)
+    infl = math.sqrt(chi2_red) if (chi2_red is not None and chi2_red > 1.0) else 1.0
+    out = []
+    for e in eval_points:
+        angs = [vp_direction_angle_at(vk, e) for vk in samples]
+        out.append(_circular_std_deg_pi(angs) * infl if len(angs) >= 5 else None)
+    return out
+
+
+def family_spatial_support(obs, img_size=None, weights=None):
+    """Bir cizgi ailesinin UZAMSAL kapsamasi. Bir VP'nin hassasiyetini en
+    cok belirleyen buyukluk, cizgilerin aile yonune DIK dogrultudaki
+    yayilimidir (aralarinda d mesafesi olan iki cizginin aci hatalari, VP
+    konumuna ~mesafe^2/d ile yansir). Ayni pencerede toplanmis 5 cizgi,
+    cepheye yayilmis 3 uzun cizgiden daha az bilgi tasiyabilir.
+
+    score = perp_span_frac (goruntu kosegenine oranla dik yayilim, 0-1)."""
+    if not obs:
+        return None
+    pts = np.array([p for o in obs for p in (o.p1, o.p2)], dtype=np.float64)
+    mids = np.array([o.midpoint for o in obs], dtype=np.float64)
+    lengths = np.array([o.length_px for o in obs], dtype=np.float64)
+    w = np.ones(len(obs)) if weights is None else np.asarray(weights, dtype=np.float64)
+    if img_size:
+        W, H = float(img_size[0]), float(img_size[1])
+    else:
+        W = max(float(np.ptp(pts[:, 0])), 1.0)
+        H = max(float(np.ptp(pts[:, 1])), 1.0)
+    diag = math.hypot(W, H)
+    two = np.radians(2.0 * np.array([o.angle_deg for o in obs]))
+    ww = w * lengths
+    mean_ang = math.atan2(float(np.sum(ww * np.sin(two))), float(np.sum(ww * np.cos(two)))) / 2.0
+    d = np.array([math.cos(mean_ang), math.sin(mean_ang)])
+    nrm = np.array([-d[1], d[0]])
+    perp = mids @ nrm
+    along = pts @ d
+    hull = _convex_hull_2d([tuple(m) for m in mids])
+    hull_area = _polygon_area(hull) if len(hull) >= 3 else 0.0
+    perp_span = float(np.ptp(perp)) / diag if len(obs) > 1 else 0.0
+    return {
+        "n_lines": len(obs),
+        "total_weighted_length_px": float(np.sum(ww)),
+        "x_span_frac": float(np.ptp(pts[:, 0])) / W,
+        "y_span_frac": float(np.ptp(pts[:, 1])) / H,
+        "hull_area_frac": hull_area / (W * H),
+        "perp_span_frac": perp_span,
+        "along_span_frac": float(np.ptp(along)) / diag,
+        "score": min(1.0, perp_span),
+    }
+
+
+def holdout_line_validation(obs, est, seed=0, k_folds=5, n_mc=30):
+    """BAGIMSIZ (fit'e katilmayan) dogrulama.
+
+    - Dogrulanmis yardimci cizgiler icin LEAVE-ONE-OUT: cizgi cikarilir,
+      VP TAM saglam kestiriciyle (RANSAC dahil) yeniden kestirilir, cikarilan
+      cizginin bu VP'ye kalintisi z = theta / sqrt(sigma_line^2 + sigma_vp^2)
+      ile olculur (sigma_vp: azaltilmis fit'in o noktadaki yon belirsizligi).
+    - Otomatik inlier'lar icin K-katli capraz dogrulama (>=5 ise). Not:
+      inlier secimi tum veriyle yapildigi icin bu kisim hafif iyimserdir.
+    Referans cizgisi hicbir zaman disarida birakilmaz (A,B,C metrigi tanimlar)."""
+    out = {"loo": [], "cv_z": [], "cv_theta_deg": [], "cv_rms_z": None, "cv_median_deg": None}
+    for i, o in enumerate(obs):
+        if not o.verified or o.is_reference:
+            continue
+        sub = obs[:i] + obs[i + 1:]
+        e = estimate_vp_weighted(sub, seed=seed, max_hypotheses=300)
+        if e is None or e["n_inliers"] < 2:
+            out["loo"].append({"line_id": o.line_id, "theta_deg": None, "z": None, "vp_unc_deg": None})
+            continue
+        inl_obs = [sub[k] for k in np.flatnonzero(e["inliers"])]
+        unc = vp_direction_uncertainty_deg(inl_obs, e["v"], [o.midpoint], n_mc=n_mc, seed=seed,
+                                           chi2_red=e["chi2_red"])[0]
+        theta = float(vp_angular_residuals_deg(o.homogeneous_line[None, :], np.array([o.midpoint]), e["v"])[0])
+        sig = math.hypot(o.sigma_angle_deg, unc or 0.0)
+        out["loo"].append({"line_id": o.line_id, "theta_deg": theta, "z": theta / sig, "vp_unc_deg": unc})
+
+    inl_all = [int(k) for k in np.flatnonzero(est["inliers"])]
+    au = [k for k in inl_all if not obs[k].verified]
+    if len(au) >= 5:
+        rng = np.random.default_rng(seed)
+        perm = rng.permutation(au)
+        folds = np.array_split(perm, min(k_folds, len(au)))
+        L, M, S = _obs_arrays(obs)
+        w = 1.0 / S ** 2
+        for f in folds:
+            fset = set(int(x) for x in f)
+            fit_idx = [k for k in inl_all if k not in fset]
+            v = fit_vp_weighted(L[fit_idx], M[fit_idx], w[fit_idx], v_init=est["v"], n_iter=3)
+            if v is None:
+                continue
+            fi = np.array(sorted(fset))
+            t = vp_angular_residuals_deg(L[fi], M[fi], v)
+            out["cv_theta_deg"] += [float(x) for x in t]
+            out["cv_z"] += [float(x) for x in t / S[fi]]
+        if out["cv_z"]:
+            out["cv_rms_z"] = float(np.sqrt(np.mean(np.square(out["cv_z"]))))
+            out["cv_median_deg"] = float(np.median(out["cv_theta_deg"]))
+    return out
+
+
+FAMILY_NAMES = {"ab": "AB", "ac": "AC"}
+
+
+def estimate_family_vps(obs_ab, obs_ac, ref_point, img_size=None, seed=0, validate=True, n_mc=60):
+    """Iki aile (AB, AC) icin VP'leri kestirir ve her aileyi teshis eder.
+
+    Bir otomatik/dogrulanmamis cizgi (ayni line_id) HER IKI ailede de inlier
+    cikarsa, daha kucuk normalize kalintiya sahip aileye atanir, digerinden
+    cikarilip o aile yeniden kestirilir - ayni kanit iki kez kullanilmaz.
+
+    Bir aile ancak referans disinda yeterli destek varsa gecerlidir: en az 1
+    dogrulanmis yardimci cizgi YA DA en az 2 dogrulanmamis cizgi."""
+    stage = {"ok": False, "families": {}, "reasons": []}
+    pools = {"ab": list(obs_ab), "ac": list(obs_ac)}
+    ests = {fam: estimate_vp_weighted(pools[fam], seed=seed + k) for k, fam in enumerate(("ab", "ac"))}
+
+    if ests["ab"] is not None and ests["ac"] is not None:
+        def unverified_inliers(fam):
+            return {pools[fam][i].line_id: i for i in np.flatnonzero(ests[fam]["inliers"])
+                    if not pools[fam][i].verified and pools[fam][i].line_id}
+        ia, ic = unverified_inliers("ab"), unverified_inliers("ac")
+        common = set(ia) & set(ic)
+        if common:
+            drop = {"ab": set(), "ac": set()}
+            for lid in common:
+                if ests["ab"]["z"][ia[lid]] <= ests["ac"]["z"][ic[lid]]:
+                    drop["ac"].add(lid)
+                else:
+                    drop["ab"].add(lid)
+            for k, fam in enumerate(("ab", "ac")):
+                if drop[fam]:
+                    pools[fam] = [o for o in pools[fam] if o.line_id not in drop[fam]]
+                    ests[fam] = estimate_vp_weighted(pools[fam], seed=seed + k)
+
+    for fam in ("ab", "ac"):
+        est, pool = ests[fam], pools[fam]
+        fd = {"est": est, "pool": pool, "ok": False}
+        name = FAMILY_NAMES[fam]
+        if est is None:
+            fd["reason"] = (f"{name} yonu: referans kenariyla tutarli bir kacis yonu kurulamadi "
+                            f"(yeterli paralel kenar kaniti yok).")
+        else:
+            inl_idx = [int(k) for k in np.flatnonzero(est["inliers"])]
+            inl_obs = [pool[k] for k in inl_idx]
+            n_helpers = sum(1 for o in inl_obs if o.verified and not o.is_reference)
+            n_unver = sum(1 for o in inl_obs if not o.verified)
+            # Yon belirsizligi SADECE referanstan degil, goruntu boyunca (3x3
+            # izgara) olculur: AB ailesinde A'dan gorulen yon referans
+            # kenarla zaten sabittir, VP hatasi UZAK bolgelerde ortaya cikar.
+            probes = [ref_point] + ([(x * img_size[0], y * img_size[1]) for x in (0.05, 0.5, 0.95)
+                                     for y in (0.05, 0.5, 0.95)] if img_size else [])
+            uncs = vp_direction_uncertainty_deg(inl_obs, est["v"], probes, n_mc=n_mc, seed=seed,
+                                                chi2_red=est["chi2_red"])
+            finite_uncs = [u for u in uncs if u is not None]
+            fd.update({
+                "inlier_obs": inl_obs, "n_inliers": len(inl_obs),
+                "n_verified_helpers": n_helpers, "n_unverified": n_unver,
+                "unc_deg": max(finite_uncs) if finite_uncs else None,
+                "unc_deg_at_ref": uncs[0],
+                "spatial": family_spatial_support(inl_obs, img_size, weights=est["w_robust"][inl_idx]),
+                "line_status": {pool[k].line_id: {"z": float(est["z"][k]), "inlier": bool(est["inliers"][k]),
+                                                  "verified": bool(pool[k].verified)}
+                                for k in range(len(pool)) if pool[k].line_id},
+                "verified_outlier_ids": [pool[k].line_id for k in est["verified_outliers"]],
+            })
+            gap = est.get("rival_gap")
+            if n_helpers == 0 and n_unver < 2:
+                fd["reason"] = (f"{name} yonu: referans kenari disinda tutarli yeterli cizgi yok (en az 1 "
+                                f"yardimci cizgi ya da 2 otomatik cizgi gerekli).")
+            elif n_helpers == 0 and n_unver < AMBIGUITY_MIN_AUTO and gap is not None and gap < AMBIGUITY_GAP_CHI2:
+                # Sentetik benchmark (tests/benchmark_helper_lines.py, 'sparse'):
+                # bu durumda projektif model cogunlukla FELAKET hatali (medyan
+                # %263) iken yerel afin model %14 - bu yuzden KULLANILMAZ.
+                fd["ambiguous"] = True
+                fd["reason"] = (f"{name} yonu: otomatik kanit BELIRSIZ - yalnizca {n_unver} otomatik cizgi var ve "
+                                f"farkli bir kacis noktasi hipotezi neredeyse ayni derecede destekleniyor (baska "
+                                f"bir duvar/zemin cizgileri olabilir). Bu yonde, ayni yuzeyde uzun ve net bir "
+                                f"paralel kenari yardimci cizgi olarak ekleyin.")
+            else:
+                fd["ok"] = True
+                if validate:
+                    fd["validation"] = holdout_line_validation(pool, est, seed=seed)
+        if fd.get("reason"):
+            stage["reasons"].append(fd["reason"])
+        stage["families"][fam] = fd
+    stage["ok"] = all(stage["families"][f]["ok"] for f in ("ab", "ac"))
+    stage["ambiguous_families"] = [f for f in ("ab", "ac") if stage["families"][f].get("ambiguous")]
+    return stage
+
+
+def _scale_eval_points(H, l_inf, A, img_size, ab_m, ac_m):
+    """Olcek belirsizligi icin degerlendirme noktalari: goruntunun 3x3
+    izgarasi (yoksa referansin 3 kati alani), sadece referansla kacis
+    cizgisinin AYNI tarafinda ve ufka cok yakin olmayanlar."""
+    if img_size:
+        W, Hh = img_size
+        cand = [(x, y) for x in (0.02 * W, 0.5 * W, 0.98 * W) for y in (0.02 * Hh, 0.5 * Hh, 0.98 * Hh)]
+    else:
+        cand = [(A[0] + dx, A[1] + dy) for dx in (-300, 0, 300) for dy in (-300, 0, 300)]
+    wA = float(l_inf @ np.array([A[0], A[1], 1.0]))
+    out = []
+    for p in cand:
+        wp = float(l_inf @ np.array([p[0], p[1], 1.0]))
+        if wp * wA > 0 and abs(wp) >= 0.05 * abs(wA):
+            out.append(p)
+    return out
+
+
+def _scale_uncertainty_mc(A, B, C, ab_m, ac_m, angle_deg, fam_ab, fam_ac, core, img_size, n_mc=40, seed=0):
+    """VP belirsizliginin METRIK olcume yansimasi: iki ailenin inlier
+    cizgileri birlikte bozulur, H yeniden kurulur, degerlendirme
+    noktalarinda (dunya X ve Y yonunde) kisa bir dunya parcasinin olculen
+    uzunlugunun goreli sapmasi hesaplanir. Doner: (en kotu nokta/eksen
+    1-sigma goreli std, ortalama) - ya da (None, None)."""
+    pts = _scale_eval_points(core["H"], core["l_inf"], A, img_size, ab_m, ac_m)
+    if not pts:
+        return None, None
+    rng = np.random.default_rng(seed)
+    s_ab = _perturbed_vp_samples(fam_ab["inlier_obs"], fam_ab["est"]["v"], n_mc, rng)
+    s_ac = _perturbed_vp_samples(fam_ac["inlier_obs"], fam_ac["est"]["v"], n_mc, rng)
+    delta = 0.01 * max(ab_m, ac_m)
+    segs = []
+    for p in pts:
+        try:
+            X = apply_transform(core["H"], p)
+            for e in ((1.0, 0.0), (0.0, 1.0)):
+                q = apply_transform(core["Hinv"], (X[0] + delta * e[0], X[1] + delta * e[1]))
+                segs.append((p, q))
+        except ValueError:
+            continue
+    if not segs:
+        return None, None
+    rel = [[] for _ in segs]
+    for va, vc in zip(s_ab, s_ac):
+        ck = _stratified_metric_from_vps(A, B, C, ab_m, ac_m, angle_deg, va, vc)
+        if ck is None:
+            continue
+        for k, (p, q) in enumerate(segs):
+            try:
+                rel[k].append(dist(apply_transform(ck["H"], p), apply_transform(ck["H"], q)) / delta - 1.0)
+            except ValueError:
+                pass
+    stds = [float(np.std(r)) for r in rel if len(r) >= 5]
+    if not stds:
+        return None, None
+    return max(stds), float(np.mean(stds))
+
+
+def _known_length_rel_error(H, known_segments):
+    if not known_segments:
+        return None
+    errs = []
+    for p, q, true_m in known_segments:
+        try:
+            m = dist(apply_transform(H, p), apply_transform(H, q))
+        except ValueError:
+            continue
+        if true_m and true_m > 0:
+            errs.append(abs(m / true_m - 1.0))
+    return float(np.mean(errs)) if errs else None
+
+
+def classify_projective_confidence(res):
+    """Guveni TEK opak skor yerine ayri, gorunur bilesenlerden siniflar:
+    uzak-bolge olcek belirsizligi (%), bagimsiz dogrulama (LOO / CV) ve
+    dogrulama verisinin VARLIGI. Bagimsiz dogrulamasi olmayan bir model,
+    kendi inlier'larina ne kadar iyi uysa da YUKSEK alamaz."""
+    reasons = []
+    val_ok, has_val_both, verified_both = True, True, True
+    for fam in ("ab", "ac"):
+        name = FAMILY_NAMES[fam]
+        if res["families"][fam]["n_verified_helpers"] == 0:
+            # Otomatik cizgilerin ORTAK/sistematik hatasi (ör. artik lens
+            # distorsiyonu) yine otomatik cizgilerle dogrulanamaz - sentetik
+            # benchmark'ta yerel+yanli otomatik kanit, dusuk tahmini
+            # belirsizlige ragmen buyuk hatalar uretebildi.
+            verified_both = False
+            reasons.append(f"{name}: elle dogrulanmis yardimci cizgi yok - otomatik cizgilerin sistematik "
+                           f"hatasi dogrulanamiyor")
+        v = res["families"][fam].get("validation") or {}
+        loo_z = [x["z"] for x in v.get("loo", []) if x.get("z") is not None]
+        bad_loo = [x["line_id"] for x in v.get("loo", []) if x.get("z") is not None and x["z"] > VP_GATE_Z]
+        if bad_loo:
+            val_ok = False
+            reasons.append(f"{name}: {', '.join(bad_loo)} diger kanitla tutarsiz (bagimsiz dogrulama z>3)")
+        if v.get("cv_rms_z") is not None and v["cv_rms_z"] > 2.0:
+            val_ok = False
+            reasons.append(f"{name}: otomatik cizgilerin capraz-dogrulama kalintisi yuksek (RMS z={v['cv_rms_z']:.1f})")
+        if not loo_z and v.get("cv_rms_z") is None:
+            has_val_both = False
+            reasons.append(f"{name}: bagimsiz dogrulama verisi yok (en az 2 yardimci cizgi ya da 5+ otomatik cizgi gerekir)")
+    su = res.get("scale_unc_far")
+    if su is not None and su <= CONF_SCALE_UNC_HIGH and val_ok and has_val_both and verified_both:
+        return "YUKSEK", reasons
+    if (su is None or su <= CONF_SCALE_UNC_MID) and val_ok:
+        return "ORTA", reasons
+    if su is not None and su > CONF_SCALE_UNC_MID:
+        reasons.append(f"uzak bolgelerde olcek belirsizligi yuksek (~%{su * 100:.1f}, 1-sigma)")
+    return "DUSUK", reasons
+
+
+def compute_metric_homography_from_observations(A, B, C, ab_m, ac_m, angle_deg, obs_ab=None, obs_ac=None,
+                                                img_size=None, stage=None, seed=0, known_segments=None,
+                                                n_mc_scale=40):
+    """ANA tek-fotograf cozucusu (kademeli rektifikasyon, gozlem tabanli):
+
+        saglam v_AB, v_AC (agirlikli, dogrulanmis-kisitli)
+        -> l_inf = v_AB x v_AC -> H_p (projektif->afin)
+        -> T_metric (A/B/C GERCEK geometri, TAM) -> H_final -> D*
+
+    Yardimci cizgiler SADECE v_AB/v_AC'yi (ve dolayisiyla l_inf'i) etkiler;
+    metrik olcek her zaman A/B/C'den gelir. stage (estimate_family_vps
+    sonucu) verilirse VP asamasi yeniden hesaplanmaz (uzunluklar VP'yi
+    etkilemez - canli yazarken onbellek icin).
+
+    Doner: compute_metric_homography_stratified ile AYNI anahtarlar + yeni
+    teshis alanlari (families, scale_unc_far, confidence, ...), ya da None
+    (stage['reasons'] nedeni aciklar)."""
+    if stage is None:
+        stage = estimate_family_vps(obs_ab, obs_ac, A, img_size=img_size, seed=seed)
+    if not stage["ok"]:
+        return None
+    fa, fc = stage["families"]["ab"], stage["families"]["ac"]
+    v_ab, v_ac = fa["est"]["v"], fc["est"]["v"]
+    core = _stratified_metric_from_vps(A, B, C, ab_m, ac_m, angle_deg, v_ab, v_ac, require_same_side=True)
+    if core is None:
+        stage["reasons"].append("Kestirilen kacis cizgisi A/B/C'nin arasindan geciyor - fiziksel olarak "
+                                "gecersiz; yardimci cizgileri kontrol edin.")
+        return None
+    H_final, Hinv_final, H_p = core["H"], core["Hinv"], core["H_p"]
+    Aw, Bw, Cw = (apply_transform(H_final, p) for p in (A, B, C))
+    v1 = (Bw[0] - Aw[0], Bw[1] - Aw[1])
+    v2 = (Cw[0] - Aw[0], Cw[1] - Aw[1])
+    ab_rec, ac_rec = dist(Aw, Bw), dist(Aw, Cw)
+    scale_unc_far, scale_unc_mean = _scale_uncertainty_mc(A, B, C, ab_m, ac_m, angle_deg, fa, fc, core,
+                                                          img_size, n_mc=n_mc_scale, seed=seed)
+    families = {}
+    for fam, f in (("ab", fa), ("ac", fc)):
+        est = f["est"]
+        inl = est["inliers"]
+        families[fam] = {
+            "n_inliers": f["n_inliers"], "n_verified_helpers": f["n_verified_helpers"],
+            "n_unverified": f["n_unverified"], "unc_deg": f["unc_deg"], "spatial": f["spatial"],
+            "validation": f.get("validation"),
+            "residual_rms_deg": float(np.sqrt(np.average(est["theta_deg"][inl] ** 2, weights=est["w_meas"][inl]))),
+            "line_status": f["line_status"], "verified_outlier_ids": f["verified_outlier_ids"],
+            "is_infinite": abs(est["v"][2]) < 1e-6 * max(1.0, float(np.linalg.norm(est["v"][:2]))),
+        }
+    res = {
+        "H": H_final, "Hinv": Hinv_final, "D_img": core["D_img"], "world_D": core["world_D"],
+        "world_A": core["world_A"], "world_B": core["world_B"], "world_C": core["world_C"],
+        "H_p": H_p, "l_inf": core["l_inf"], "v_ab_hom": v_ab, "v_ac_hom": v_ac,
+        "n_inliers_ab": fa["n_inliers"], "n_inliers_ac": fc["n_inliers"],
+        "v_ab_uncertainty": {"angular_std_deg": fa["unc_deg"]},
+        "v_ac_uncertainty": {"angular_std_deg": fc["unc_deg"]},
+        "affine_residual_ab_deg": _rectified_orientation_std_deg(H_p, [(o.p1, o.p2) for o in fa["inlier_obs"]]),
+        "affine_residual_ac_deg": _rectified_orientation_std_deg(H_p, [(o.p1, o.p2) for o in fc["inlier_obs"]]),
+        "ab_recovered": ab_rec, "ac_recovered": ac_rec, "ab_input": ab_m, "ac_input": ac_m,
+        "angle_recovered_deg": _angle_between_dirs(v1, v2), "angle_input_deg": angle_deg,
+        "ref_scale": (dist(A, B) + dist(A, C)) / 2.0,
+        "ref_recovery_rel_err": max(abs(ab_rec - ab_m) / ab_m, abs(ac_rec - ac_m) / ac_m),
+        "scale_unc_far": scale_unc_far, "scale_unc_mean": scale_unc_mean,
+        "known_length_rel_err": _known_length_rel_error(H_final, known_segments),
+        "families": families, "stage": stage,
+    }
+    res["confidence"], res["confidence_reasons"] = classify_projective_confidence(res)
+    return res
+
+
+def _rms(values):
+    vals = [v for v in values if v is not None]
+    return float(np.sqrt(np.mean(np.square(vals)))) if vals else None
+
+
+def summarize_model_validation(res):
+    """Model karsilastirmasi icin AYRI AYRI gorunur bilesenler (tek bir opak
+    skor degil): aile basina VP yon belirsizligi, bagimsiz (hold-out)
+    kalinti, uzamsal kapsama, in-sample kalinti; ayrica referans geri-kazanim
+    hatasi, uzak-bolge olcek belirsizligi, bilinen-uzunluk hatasi."""
+    if res is None:
+        return None
+    out = {"scale_unc_far": res.get("scale_unc_far"), "confidence": res.get("confidence"),
+           "ref_recovery_rel_err": res.get("ref_recovery_rel_err"),
+           "known_length_rel_err": res.get("known_length_rel_err")}
+    for fam in ("ab", "ac"):
+        f = res["families"][fam]
+        val = f.get("validation") or {}
+        zs = [x["z"] for x in val.get("loo", [])] + list(val.get("cv_z", []))
+        ths = [x["theta_deg"] for x in val.get("loo", [])] + list(val.get("cv_theta_deg", []))
+        ths = [t for t in ths if t is not None]
+        out[f"vp_unc_deg_{fam}"] = f["unc_deg"]
+        out[f"holdout_rms_z_{fam}"] = _rms(zs)
+        out[f"holdout_median_deg_{fam}"] = float(np.median(ths)) if ths else None
+        out[f"spatial_{fam}"] = (f["spatial"] or {}).get("perp_span_frac")
+        out[f"residual_rms_deg_{fam}"] = f["residual_rms_deg"]
+        out[f"n_lines_{fam}"] = f["n_inliers"]
+    return out
+
+
+def _line_z_under_family(new_obs, fam_stage, seed=0, n_mc=40):
+    """Yeni bir cizginin, bir ailenin MEVCUT VP'sine normalize kalintisi
+    (VP'nin o noktadaki belirsizligi dahil)."""
+    est = fam_stage["est"]
+    theta = float(vp_angular_residuals_deg(new_obs.homogeneous_line[None, :], np.array([new_obs.midpoint]),
+                                           est["v"])[0])
+    unc = vp_direction_uncertainty_deg(fam_stage["inlier_obs"], est["v"], [new_obs.midpoint], n_mc=n_mc,
+                                       seed=seed, chi2_red=est["chi2_red"])[0]
+    return theta, theta / math.hypot(new_obs.sigma_angle_deg, unc or 0.0), unc
+
+
+def suggest_line_family(new_obs, res, seed=0):
+    """'auto' aileli bir yardimci cizgi icin ONERI (kesin karar degil).
+    Yerel aciya degil, VP tutarliligina bakar: l^T v_AB ~ 0 mi, l^T v_AC ~ 0
+    mi? Bir aile ancak (a) z <= 3 ve (b) log-olabilirlik farki
+    (z_diger^2 - z_secilen^2)/2 >= 4.5 (~90:1) ise onerilir; aksi halde None
+    (belirsiz - kullaniciya sorulur)."""
+    if res is None:
+        return None, {}
+    zs = {}
+    for fam in ("ab", "ac"):
+        f = res["stage"]["families"][fam]
+        if not f.get("ok"):
+            continue
+        _theta, z, _unc = _line_z_under_family(new_obs, f, seed=seed)
+        zs[fam] = z
+    if len(zs) < 2:
+        return None, zs
+    best = min(zs, key=zs.get)
+    other = "ac" if best == "ab" else "ab"
+    if zs[best] <= VP_GATE_Z and zs[other] ** 2 - zs[best] ** 2 >= 9.0:
+        return best, zs
+    return None, zs
+
+
+def helper_duplicates_reference(p1, p2, ref_p, ref_q, angle_tol_deg=2.0, offset_px=None):
+    """Yardimci cizgi, referans cizgisiyle (A-B ya da A-C) neredeyse AYNI
+    goruntu dogrusu uzerinde mi? Ayni dogru bagimsiz projektif bilgi
+    tasimaz (VP'yi yalnizca referansin kendisi kadar belirler)."""
+    a1 = math.degrees(math.atan2(p2[1] - p1[1], p2[0] - p1[0]))
+    a2 = math.degrees(math.atan2(ref_q[1] - ref_p[1], ref_q[0] - ref_p[0]))
+    da = abs(a1 - a2) % 180.0
+    da = min(da, 180.0 - da)
+    l = _line_through(ref_p, ref_q)
+    nrm = math.hypot(l[0], l[1])
+    if nrm < 1e-12:
+        return False
+    mid = ((p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0)
+    off = abs(l[0] * mid[0] + l[1] * mid[1] + l[2]) / nrm
+    tol = offset_px if offset_px is not None else max(5.0, 0.05 * dist(ref_p, ref_q))
+    return da <= angle_tol_deg and off <= tol
+
+
+def assess_helper_addition(A, B, C, ab_m, ac_m, angle_deg, obs_ab, obs_ac, new_obs, img_size=None,
+                           known_segments=None, seed=0):
+    """Yeni bir yardimci cizgiyi KABUL ETMEDEN ONCE aday modeli hesaplar ve
+    eski modelle karsilastirir (Bolum 20-24).
+
+    verdict:
+      accept               - mevcut modelle tutarli, dogrulama kotulesmedi
+      accept_validated     - catisma vardi ama BAGIMSIZ veri (diger
+                             yardimci cizgilerin LOO kalintisi / bilinen
+                             uzunluklar) yeni modeli destekliyor
+      accept_unvalidated   - onceden model yoktu; karsilastirma yapilamaz
+      inconsistent / worse - catisma var, karar icin bagimsiz veri yok -> kullaniciya sor
+      rejected_by_validation - bagimsiz veri ESKI modeli destekliyor -> kullaniciya sor
+      no_model             - bu cizgiyle de model kurulamiyor"""
+    fam = new_obs.family
+    before = compute_metric_homography_from_observations(A, B, C, ab_m, ac_m, angle_deg, obs_ab, obs_ac,
+                                                         img_size=img_size, seed=seed, known_segments=known_segments)
+    nab = list(obs_ab) + ([new_obs] if fam == "ab" else [])
+    nac = list(obs_ac) + ([new_obs] if fam == "ac" else [])
+    after = compute_metric_homography_from_observations(A, B, C, ab_m, ac_m, angle_deg, nab, nac,
+                                                        img_size=img_size, seed=seed, known_segments=known_segments)
+    out = {"family": fam, "before": summarize_model_validation(before), "after": summarize_model_validation(after),
+           "before_result": before, "after_result": after, "z_before": None, "theta_before": None,
+           "outlier_in_after": False, "worse": False, "verdict": None}
+    if before is not None:
+        theta, z, _unc = _line_z_under_family(new_obs, before["stage"]["families"][fam], seed=seed)
+        out["theta_before"], out["z_before"] = theta, z
+    if after is not None:
+        out["outlier_in_after"] = new_obs.line_id in after["families"][fam]["verified_outlier_ids"]
+    if after is None:
+        out["verdict"] = "no_model"
+        return out
+    if before is None:
+        out["verdict"] = "accept_unvalidated"
+        return out
+    sb, sa = out["before"], out["after"]
+    ub, ua = sb[f"vp_unc_deg_{fam}"], sa[f"vp_unc_deg_{fam}"]
+    hb, ha = sb[f"holdout_rms_z_{fam}"], sa[f"holdout_rms_z_{fam}"]
+    worse = (ub is not None and ua is not None and ua > 1.25 * ub + 1e-6) or \
+            (hb is not None and ha is not None and ha > 1.25 * hb + 0.25)
+    out["worse"] = worse
+    consistent = out["z_before"] <= VP_GATE_Z and not out["outlier_in_after"]
+    if consistent and not worse:
+        out["verdict"] = "accept"
+        return out
+    # Catisma: bagimsiz veri (ayni ailenin DIGER yardimci cizgilerinin LOO
+    # kalintisi + bilinen uzunluklar) hangi modeli destekliyor?
+    other_ids = {o.line_id for o in (obs_ab if fam == "ab" else obs_ac) if o.verified and not o.is_reference}
+    def loo_map(r):
+        val = r["families"][fam].get("validation") or {}
+        return {x["line_id"]: x["z"] for x in val.get("loo", []) if x.get("z") is not None}
+    lb, la = loo_map(before), loo_map(after)
+    common = [i for i in other_ids if i in lb and i in la]
+    evidence = []
+    if common:
+        evidence.append(_rms([la[i] for i in common]) < _rms([lb[i] for i in common]))
+    kb, ka = sb["known_length_rel_err"], sa["known_length_rel_err"]
+    if kb is not None and ka is not None:
+        evidence.append(ka < kb)
+    out["independent_evidence"] = evidence
+    if evidence and all(evidence):
+        out["verdict"] = "accept_validated"
+    elif evidence:
+        out["verdict"] = "rejected_by_validation"
+    else:
+        out["verdict"] = "inconsistent" if not consistent else "worse"
+    return out
+
+
+def detect_line_observations(gray, max_segments=250, min_length_px=25):
+    """detect_line_segments (LSD/Hough) sonucunu LineObservation'a cevirir:
+    her parcanin gradyan gucu (kenar kontrasti) ve tespit olcegine bagli
+    uc-nokta belirsizligi hesaplanir. Zayif kontrastli parcalar daha buyuk
+    sigma alir (sigma_e ~ 0.7px/olcek * medyan_guc/guc, [0.5, 3] ile
+    sinirli). Otomatik cizgiler DOGRULANMAMIS (verified=False) isaretlenir."""
+    segs = detect_line_segments(gray, max_segments=max_segments, min_length_px=min_length_px)
+    if not segs:
+        return []
+    h, w = gray.shape[:2]
+    scale = min(1.0, 1600.0 / max(h, w))
+    small = cv2.resize(gray, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA) if scale < 1 else gray
+    mag = _gradient_magnitude(small)
+    sh, sw = mag.shape
+    strengths = []
+    for p, q in segs:
+        ts = np.linspace(0.1, 0.9, 15)
+        xs = np.clip(((p[0] + ts * (q[0] - p[0])) * scale).round().astype(int), 0, sw - 1)
+        ys = np.clip(((p[1] + ts * (q[1] - p[1])) * scale).round().astype(int), 0, sh - 1)
+        strengths.append(float(np.mean(mag[ys, xs])))
+    g_med = float(np.median(strengths)) or 1.0
+    obs = []
+    for k, ((p, q), g) in enumerate(zip(segs, strengths)):
+        length = math.hypot(q[0] - p[0], q[1] - p[1])
+        sigma_e = LINE_ENDPOINT_SIGMA_PX["auto"] / scale * float(np.clip(g_med / max(g, 1e-6), 0.5, 3.0))
+        obs.append(LineObservation(p, q, source="auto", verified=False, family="auto", line_id=f"AUTO{k}",
+                                   endpoint_sigma_px=sigma_e, n_support=max(2, int(length * scale)),
+                                   gradient_strength=g))
+    return obs
+
+
+def refine_line_to_edge(gray, p1, p2, search_radius=4.0, min_valid_frac=0.6, max_rms_px=1.0,
+                        max_angle_change_deg=3.0, min_contrast_ratio=2.0):
+    """Kaba secilmis bir yardimci cizgiyi gercek goruntu kenarina oturtur:
+    cizgi boyunca orneklenen noktalarda dik yonde gradyan pikinin subpixel
+    konumu bulunur, robust (MAD-tabanli) TLS ile dogru fit edilir, kaba uc
+    noktalar bu dogruya izdusurulur. Dusuk kontrast, belirsiz (cift kenar)
+    ya da kavisli kenarlarda (None, neden) doner - inceltme ZORLANMAZ.
+
+    Doner: ({p1, p2, n_support, rms_px, strength}, None) ya da (None, neden)."""
+    x1, y1 = float(p1[0]), float(p1[1])
+    x2, y2 = float(p2[0]), float(p2[1])
+    L = math.hypot(x2 - x1, y2 - y1)
+    if L < 15:
+        return None, "cizgi cok kisa"
+    pad = search_radius + 3
+    h, w = gray.shape[:2]
+    x0 = int(max(0, math.floor(min(x1, x2) - pad)))
+    y0 = int(max(0, math.floor(min(y1, y2) - pad)))
+    xe = int(min(w, math.ceil(max(x1, x2) + pad) + 1))
+    ye = int(min(h, math.ceil(max(y1, y2) + pad) + 1))
+    if xe - x0 < 3 or ye - y0 < 3:
+        return None, "goruntu disinda"
+    mag = _gradient_magnitude(gray[y0:ye, x0:xe])
+    d = np.array([(x2 - x1) / L, (y2 - y1) / L])
+    nrm = np.array([-d[1], d[0]])
+    n = int(np.clip(L / 2.0, 10, 300))
+    pts, strengths = [], []
+    for t in np.linspace(0.03, 0.97, n) * L:
+        c = np.array([x1 - x0, y1 - y0]) + t * d
+        offsets, vals = _sample_along(mag, c, nrm, search_radius)
+        finite = np.isfinite(vals)
+        if finite.sum() < 5:
+            continue
+        idx = int(np.argmax(np.where(finite, vals, -np.inf)))
+        if idx <= 0 or idx >= len(vals) - 1:
+            continue  # yaricap icinde net bir tepe yok
+        peak = _subpixel_peak(offsets, vals)
+        if peak is None:
+            continue
+        pts.append(c + peak * nrm + np.array([x0, y0]))
+        strengths.append(float(vals[idx]))
+    if len(pts) < min_valid_frac * n:
+        return None, "kenar boyunca yeterli gradyan bulunamadi"
+    med_strength = float(np.median(strengths))
+    if med_strength < min_contrast_ratio * max(float(np.median(mag)), 1e-6):
+        return None, "dusuk kontrast"
+    P = np.array(pts)
+    keep = np.ones(len(P), dtype=bool)
+    for _ in range(3):
+        centroid, direction, normal = _fit_line_tls(P[keep])
+        r = (P - centroid) @ normal
+        s = 1.4826 * float(np.median(np.abs(r[keep]))) + 1e-6
+        keep = np.abs(r) <= max(2.5 * s, 0.3)
+        if keep.sum() < 5:
+            return None, "belirsiz kenar"
+    centroid, direction, normal = _fit_line_tls(P[keep])
+    r = (P[keep] - centroid) @ normal
+    rms = float(np.sqrt(np.mean(r ** 2)))
+    if keep.sum() < 0.8 * min_valid_frac * n:
+        return None, "belirsiz kenar (cok fazla aykiri ornek)"
+    if rms > max_rms_px:
+        return None, "kenar duz degil ya da belirsiz"
+    ang = math.degrees(math.acos(min(1.0, abs(float(direction @ d)))))
+    if ang > max_angle_change_deg:
+        return None, "inceltilmis yon kaba secimden cok farkli"
+    e1 = centroid + float((np.array([x1, y1]) - centroid) @ direction) * direction
+    e2 = centroid + float((np.array([x2, y2]) - centroid) @ direction) * direction
+    return {"p1": (float(e1[0]), float(e1[1])), "p2": (float(e2[0]), float(e2[1])),
+            "n_support": int(keep.sum()), "rms_px": rms, "strength": med_strength}, None
 
 
 # =======================================================================
@@ -3089,6 +4151,25 @@ class MeasureApp(tk.Tk):
         self.line_calib_current = []   # aktif ("bitirilmemis") duz kenarin kaba noktalari
         self.line_calib_lines = []     # bitirilmis duz kenarlar: [[(x,y), ...], ...]
 
+        # YARDIMCI CIZGILER: noktalardan AYRI geometrik gozlemler (kontrol/
+        # olcum noktasi DEGIL). Hem nokta-sonrasi akis hem de "Daha Yuksek
+        # Dogruluk" paneli (eski nokta-cifti comboboxlari dahil) AYNI listeyi
+        # kullanir. Ornek kayit:
+        #   {"id": "HL1", "p1": [x, y], "p2": [x, y], "family": "ab"|"ac"|"auto",
+        #    "source": "manual"|"manual_magnifier"|"manual_refined"|"point_pair",
+        #    "anchor_label": "B"|None, "point_labels": [l1, l2]|None,
+        #    "verified": True, "endpoint_sigma_px": 1.0, "n_support": 2,
+        #    "sigma_angle_deg": ..., "note": ""}
+        self.helper_lines = []
+        self._helper_counter = 0
+        # Yardimci cizgi yakalama durumu (normal nokta/kenar/lens modlarindan
+        # AYRI): {"family", "anchor_label", "points": [(x,y)], "sigmas": [px]}
+        self.helper_capture = None
+        self.helper_status = {}        # son cozumdeki cizgi tutarliligi: {id: {...}}
+        self._selected_helper_id = None
+        self._vp_stage_cache = (None, None)
+        self._pan_press_xy = None
+
         self.unit_var = tk.StringVar(value="m")
         self.ref_mode_var = tk.StringVar(value="abc2len")
         self.coords_rows = []          # [{"label":..., "x_m":..., "y_m":...}, ...] ("coords" modu)
@@ -3189,6 +4270,9 @@ class MeasureApp(tk.Tk):
         self.magnifier_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(toolbar, text="Buyutecli Nokta Ekleme", variable=self.magnifier_var).pack(
             side="left", padx=(12, 0))
+        self.helper_prompt_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(toolbar, text="Noktadan sonra yardimci cizgi oner",
+                        variable=self.helper_prompt_var).pack(side="left", padx=(12, 0))
         self.status_var = tk.StringVar(value="Once bir fotograf acin.")
         ttk.Label(toolbar, textvariable=self.status_var, foreground="#555").pack(side="left", padx=12)
 
@@ -3269,6 +4353,9 @@ class MeasureApp(tk.Tk):
         self.canvas.bind("<MouseWheel>", self.on_mousewheel)
         self.canvas.bind("<ButtonPress-3>", self.on_pan_start)
         self.canvas.bind("<B3-Motion>", self.on_pan_move)
+        self.canvas.bind("<ButtonRelease-3>", self.on_pan_release)
+        self.canvas.bind("<Motion>", self._on_canvas_motion)
+        self.bind("<Escape>", lambda e: self.cancel_helper_capture())
         self.canvas.bind("<Configure>", self._on_canvas_resize)
 
         self.vscroll = ttk.Scrollbar(canvas_frame, orient="vertical", command=self._on_vscroll)
@@ -3467,29 +4554,65 @@ class MeasureApp(tk.Tk):
         self.abc_angle_entry.pack(side="left", padx=4)
         self.abc_angle_entry.bind("<KeyRelease>", self._try_auto_compute_plane)
 
-        # Yardimci cizgiler: SADECE asagidaki durum mesaji "daha dogru sonuc
-        # icin yardimci cizgi gerekli" derse doldurulmasi istenen, ikincil/
-        # ISTEGE BAGLI bir alan - kullaniciyi baslangicta bir yontem secimiyle
-        # karsilamiyoruz, sadece sistem D'nin gercek (projektif) konumunu
-        # dogrulayamadiginda ekstra kanit istiyoruz.
+        # Yardimci cizgiler: A-B ya da A-C ile GERCEKTE paralel olan baska
+        # kenarlar. Nokta-sonrasi akisla eklenenler ve asagidaki eski
+        # nokta-cifti secimleri AYNI self.helper_lines listesine yazilir.
         self.helper_lines_frame = ttk.LabelFrame(self.abc2len_frame, text="Daha Yuksek Dogruluk (opsiyonel)")
         self.helper_lines_frame.pack(fill="x", padx=4, pady=(8, 4))
         ttk.Label(self.helper_lines_frame,
-                  text="Sadece asagidaki durum mesaji isterse doldurun - baska bir\n"
-                       "yerde gorunen, AYNI yonde bir kenarin 2 ucunu secin.",
+                  text="Yardimci cizgi, A-B veya A-C ile gercekte paralel olan baska bir kenardir. "
+                       "Fotografin farkli bir bolgesindeki uzun ve net bir kenar secmek perspektif "
+                       "hesabini iyilestirir. (Kenar, A/B/C ile AYNI yuzeyde olmali - zemin, yan "
+                       "duvar, balkon onu ya da pencere icindeki girinti kullanilmamali.)",
                   foreground="#555", justify="left", wraplength=410).pack(anchor="w", padx=4, pady=(4, 4))
-        ttk.Label(self.helper_lines_frame, text="AB yonunde baska bir kenar:",
-                  foreground="#555", justify="left", wraplength=410).pack(anchor="w", padx=4, pady=(4, 0))
+
+        hl_opts = ttk.Frame(self.helper_lines_frame)
+        hl_opts.pack(fill="x", padx=4, pady=2)
+        self.show_helpers_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(hl_opts, text="Yardimci cizgileri goster", variable=self.show_helpers_var,
+                        command=self._redraw).pack(side="left")
+        self.helper_refine_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(hl_opts, text="Kenara oturt (subpixel)", variable=self.helper_refine_var).pack(
+            side="left", padx=(10, 0))
+
+        hl_new = ttk.Frame(self.helper_lines_frame)
+        hl_new.pack(fill="x", padx=4, pady=2)
+        ttk.Label(hl_new, text="Yeni kenar sec:").pack(side="left")
+        ttk.Button(hl_new, text="AB yonu", command=lambda: self.start_helper_capture("ab")).pack(side="left", padx=2)
+        ttk.Button(hl_new, text="AC yonu", command=lambda: self.start_helper_capture("ac")).pack(side="left", padx=2)
+        ttk.Button(hl_new, text="Otomatik", command=lambda: self.start_helper_capture("auto")).pack(side="left", padx=2)
+
+        self.helper_tree = ttk.Treeview(self.helper_lines_frame,
+                                        columns=("id", "family", "source", "anchor", "status"),
+                                        show="headings", height=4, selectmode="browse")
+        for col, txt, wdt in (("id", "ID", 50), ("family", "Yon", 50), ("source", "Kaynak", 95),
+                              ("anchor", "Capa", 45), ("status", "Tutarlilik", 150)):
+            self.helper_tree.heading(col, text=txt)
+            self.helper_tree.column(col, width=wdt, stretch=(col == "status"))
+        self.helper_tree.pack(fill="x", padx=4, pady=2)
+        self.helper_tree.bind("<<TreeviewSelect>>", self._on_helper_tree_select)
+        hl_btns = ttk.Frame(self.helper_lines_frame)
+        hl_btns.pack(fill="x", padx=4, pady=(0, 4))
+        ttk.Button(hl_btns, text="Sil", command=self.delete_selected_helper).pack(side="left")
+        ttk.Button(hl_btns, text="AB yap", command=lambda: self.set_selected_helper_family("ab")).pack(
+            side="left", padx=2)
+        ttk.Button(hl_btns, text="AC yap", command=lambda: self.set_selected_helper_family("ac")).pack(
+            side="left", padx=2)
+        ttk.Button(hl_btns, text="Otomatik (oner)", command=self.suggest_selected_helper_family).pack(
+            side="left", padx=2)
+
+        ttk.Label(self.helper_lines_frame, text="Eski yontem - mevcut iki noktayla (AB yonunde baska bir kenar):",
+                  foreground="#555", justify="left", wraplength=410).pack(anchor="w", padx=4, pady=(6, 0))
         hab_row = ttk.Frame(self.helper_lines_frame)
         hab_row.pack(fill="x", padx=4, pady=2)
         self.abc_helper_ab_combos = []
         for _ in range(2):
             cb = ttk.Combobox(hab_row, width=10, state="readonly")
             cb.pack(side="left", padx=4)
-            cb.bind("<<ComboboxSelected>>", self._try_auto_compute_plane)
+            cb.bind("<<ComboboxSelected>>", lambda e: self._on_legacy_helper_combo("ab"))
             self.abc_helper_ab_combos.append(cb)
 
-        ttk.Label(self.helper_lines_frame, text="AC yonunde baska bir kenar:",
+        ttk.Label(self.helper_lines_frame, text="Eski yontem - mevcut iki noktayla (AC yonunde baska bir kenar):",
                   foreground="#555", justify="left", wraplength=410).pack(anchor="w", padx=4, pady=(6, 0))
         hac_row = ttk.Frame(self.helper_lines_frame)
         hac_row.pack(fill="x", padx=4, pady=2)
@@ -3497,7 +4620,7 @@ class MeasureApp(tk.Tk):
         for _ in range(2):
             cb = ttk.Combobox(hac_row, width=10, state="readonly")
             cb.pack(side="left", padx=4)
-            cb.bind("<<ComboboxSelected>>", self._try_auto_compute_plane)
+            cb.bind("<<ComboboxSelected>>", lambda e: self._on_legacy_helper_combo("ac"))
             self.abc_helper_ac_combos.append(cb)
 
         # --- ortak: durum/kontrol ---
@@ -3869,6 +4992,14 @@ class MeasureApp(tk.Tk):
         self._last_ref_corners = None
         self._last_ref_label = None
         self._last_confirmed_ref_signature = None
+        self.helper_lines = []
+        self._helper_counter = 0
+        self.helper_capture = None
+        self.helper_status = {}
+        self._selected_helper_id = None
+        self._vp_stage_cache = (None, None)
+        if hasattr(self, "helper_tree"):
+            self._refresh_helper_tree()
         if hasattr(self, "saved_planes_list"):
             self._refresh_saved_planes_list()
         if hasattr(self, "edge_mode_btn"):
@@ -4060,6 +5191,7 @@ class MeasureApp(tk.Tk):
         if self.pil_img is None:
             return
         self._pan_start = (event.x, event.y, self.view_x, self.view_y)
+        self._pan_press_xy = (event.x, event.y)
 
     def on_pan_move(self, event):
         if self.pil_img is None or self._pan_start is None:
@@ -4069,6 +5201,27 @@ class MeasureApp(tk.Tk):
         self.view_y = oy - (event.y - sy) / self.view_scale
         self._clamp_view()
         self._redraw()
+
+    def on_pan_release(self, event):
+        """Sag tik SURUKLENMEDEN birakilirsa ve yardimci cizgi yakalaniyorsa
+        yakalamayi iptal eder (sag tik + surukle hala kaydirma yapar)."""
+        press = self._pan_press_xy
+        self._pan_press_xy = None
+        if self.helper_capture is not None and press is not None and                 math.hypot(event.x - press[0], event.y - press[1]) < 4:
+            self.cancel_helper_capture()
+
+    def _on_canvas_motion(self, event):
+        """Yardimci cizginin ilk ucu secildiyse, fareye kadar uzanan gecici
+        bir onizleme cizgisi (tuval ogesi - tam yeniden cizim yapmadan)."""
+        self.canvas.delete("helper_rubber")
+        cap = self.helper_capture
+        if cap is None or len(cap["points"]) != 1:
+            return
+        x0 = (cap["points"][0][0] - self.view_x) * self.view_scale
+        y0 = (cap["points"][0][1] - self.view_y) * self.view_scale
+        color = "#%02x%02x%02x" % HELPER_COLORS.get(cap["family"], HELPER_COLORS["auto"])
+        self.canvas.create_line(x0, y0, event.x, event.y, fill=color, width=2, dash=(6, 4),
+                                tags="helper_rubber")
 
     def _canvas_to_image(self, cx, cy):
         return self.view_x + cx / self.view_scale, self.view_y + cy / self.view_scale
@@ -4162,6 +5315,8 @@ class MeasureApp(tk.Tk):
             draw.ellipse([x - r, y - r, x + r, y + r], fill=color, outline=(255, 255, 255), width=2)
             draw.text((x + 8, y - 10), p["label"], fill=color, font=self.font_label,
                       stroke_width=2, stroke_fill=(0, 0, 0))
+
+        self._draw_helper_lines(draw, sc)
 
         if self.edge_rough_points:
             pts_sc = [sc(p) for p in self.edge_rough_points]
@@ -4325,6 +5480,13 @@ class MeasureApp(tk.Tk):
             return
         orig_x, orig_y = self._canvas_to_image(event.x, event.y)
 
+        if self.helper_capture is not None:
+            if self.magnifier_var.get():
+                self._open_point_magnifier(orig_x, orig_y, on_confirm=self._helper_capture_add_endpoint)
+            else:
+                self._helper_capture_add_endpoint(orig_x, orig_y, "manual")
+            return
+
         if self.edge_mode:
             self.edge_rough_points.append((orig_x, orig_y))
             self._redraw()
@@ -4365,6 +5527,8 @@ class MeasureApp(tk.Tk):
         self._redraw()
         self._refresh_all_display()
         self.status_var.set(f"'{label}' eklendi. Toplam {len(self.points)} nokta.")
+        if self.helper_prompt_var.get():
+            self.after_idle(lambda: self._offer_helper_after_point(label))
 
     # ---------- Buyutecli hassas nokta yerlestirme ----------
     # SimpleMeasure gibi profesyonel olcum yazilimlarinda goruldugu uzere:
@@ -4377,8 +5541,9 @@ class MeasureApp(tk.Tk):
     MAGNIFIER_ZOOM = 8
     MAGNIFIER_NUDGE = 1.0
 
-    def _open_point_magnifier(self, init_x, init_y):
+    def _open_point_magnifier(self, init_x, init_y, on_confirm=None):
         self._mag_point = [init_x, init_y]
+        self._mag_on_confirm = on_confirm
         win = tk.Toplevel(self)
         win.title("Nokta Konumunu Ayarla")
         win.transient(self)
@@ -4456,7 +5621,9 @@ class MeasureApp(tk.Tk):
     def _confirm_mag(self):
         x, y = self._mag_point
         self._mag_win.destroy()
-        self._finish_adding_point(x, y, source="manual_magnifier")
+        callback = getattr(self, "_mag_on_confirm", None) or self._finish_adding_point
+        self._mag_on_confirm = None
+        callback(x, y, "manual_magnifier")
 
     def _cancel_mag(self):
         self._mag_win.destroy()
@@ -4471,12 +5638,659 @@ class MeasureApp(tk.Tk):
 
     def _remove_references_to(self, label):
         self.queries = [q for q in self.queries if label not in (q["a"], q["b"], q.get("c"))]
+        # Yardimci cizgiler: silinen noktaya bagli bir iliski SESSIZCE
+        # korunmaz. Fiziksel uc noktalar (kenarin goruntudeki konumu) aynen
+        # kalir, ama etiket bagi koparilir - ayni etiket sonradan baska bir
+        # noktaya verilirse cizgi o noktayi TAKIP ETMEZ.
+        detached = []
+        for hl in self.helper_lines:
+            if hl.get("anchor_label") == label:
+                hl["anchor_label"] = None
+                hl["note"] = f"capa noktasi '{label}' silindi; kenar konumu korundu"
+                detached.append(hl["id"])
+            if hl.get("point_labels") and label in hl["point_labels"]:
+                hl["point_labels"] = None
+                hl["source"] = "manual"
+                hl["note"] = f"'{label}' noktasi silindi; kenar konumu korundu, nokta bagi koparildi"
+                detached.append(hl["id"])
+        for combos in (self.abc_helper_ab_combos, self.abc_helper_ac_combos):
+            if any(cb.get() == label for cb in combos):
+                for cb in combos:
+                    cb.set("")
+        if detached:
+            self._vp_stage_cache = (None, None)
+            self._refresh_helper_tree()
+            self.status_var.set(f"'{label}' silindi - bagli yardimci cizgi(ler) ({', '.join(sorted(set(detached)))}) "
+                                 f"noktadan ayrildi, kenar konumu korundu.")
         if self.plane_corners and label in self.plane_corners:
             self.plane_corners = None
             self.plane_H = None
             self.plane_Hinv = None
             self.plane_calibrated = False
             self.plane_status_var.set("Duzlem henuz ayarlanmadi (bir kose silindi).")
+
+    # ---------- Yardimci cizgiler (nokta akisi + Daha Yuksek Dogruluk paneli) ----------
+
+    HELPER_SOURCE_LABELS = {"manual": "elle", "manual_magnifier": "elle (buyutec)",
+                            "manual_refined": "elle + kenar", "point_pair": "nokta cifti"}
+
+    def _choice_dialog(self, title, text, buttons, default=None):
+        """Kucuk, modal secim penceresi. Enter/Esc/kapatma = default."""
+        result = {"key": default}
+        win = tk.Toplevel(self)
+        win.title(title)
+        win.transient(self)
+        win.resizable(False, False)
+        ttk.Label(win, text=text, justify="left", wraplength=480).pack(padx=12, pady=(12, 8), anchor="w")
+        row = ttk.Frame(win)
+        row.pack(padx=12, pady=(0, 12), fill="x")
+
+        def choose(k):
+            result["key"] = k
+            win.destroy()
+
+        for i, (key, label) in enumerate(buttons):
+            b = ttk.Button(row, text=label, command=lambda k=key: choose(k))
+            b.grid(row=i // 3, column=i % 3, padx=3, pady=2, sticky="ew")
+            if key == default:
+                b.focus_set()
+        win.bind("<Return>", lambda e: choose(default))
+        win.bind("<Escape>", lambda e: choose(default))
+        win.protocol("WM_DELETE_WINDOW", lambda: choose(default))
+        win.grab_set()
+        self.wait_window(win)
+        return result["key"]
+
+    def _point_role(self, label):
+        """Etiketin referanstaki rolu (A/B/C) - comboboxlardan, yoksa
+        (henuz secim yapilmamissa) varsayilan A/B/C etiketlerinden."""
+        combos = [cb.get() for cb in self.abc_combos]
+        for role, lb in zip("ABC", combos):
+            if lb == label:
+                return role
+        if not any(combos) and label in ("A", "B", "C"):
+            return label
+        return None
+
+    def _offer_helper_after_point(self, label):
+        """Nokta eklendikten SONRA hafif, ISTEGE BAGLI soru. Enter/Hayir ile
+        akis eskisi gibi devam eder."""
+        if self.pil_img is None or self.helper_capture is not None:
+            return
+        if not any(p["label"] == label for p in self.points):
+            return
+        role = self._point_role(label)
+        rec = {"B": "ab", "C": "ac"}.get(role)
+        hint = ""
+        if role == "A":
+            hint = ("\n\nA ortak kosedir - hem AB hem AC yonune katilir. Hangi yonde bir kenar "
+                    "ekleyeceginizi acikca secin.")
+        elif rec:
+            hint = (f"\n\n{label} ile {FAMILY_NAMES[rec]} referans kenari tanimlandi; bu yonde baska bir "
+                    f"kenar eklemek en dogal secimdir (kenar baska bir yerde de olabilir).")
+        buttons = [("no", "Hayir"),
+                   ("ab", "AB yonu" + (" (onerilen)" if rec == "ab" else "")),
+                   ("ac", "AC yonu" + (" (onerilen)" if rec == "ac" else "")),
+                   ("auto", "Otomatik"),
+                   ("later", "Yonu daha sonra belirle")]
+        choice = self._choice_dialog(
+            "Yardimci cizgi ekle?",
+            f"'{label}' eklendi. Bu nokta icin yardimci cizgi eklemek ister misiniz?\n\n"
+            f"Yardimci cizgi, A-B veya A-C ile gercekte paralel olan baska bir kenardir. "
+            f"Istemiyorsaniz Enter (Hayir) ile devam edin.{hint}",
+            buttons, default="no")
+        if choice in (None, "no"):
+            return
+        mode = self._choice_dialog(
+            "Yardimci cizgi",
+            f"Kenari nasil secmek istersiniz?\n\n"
+            f"Bu noktadan baslat: '{label}' kenarin bir ucu olur; ayni gercek kenar uzerinde "
+            f"ikinci bir nokta tiklayin.\n\n"
+            f"Baska kenar sec: fotografin herhangi bir yerindeki bir kenarin iki ucunu tiklayin "
+            f"(en faydalisi: referanstan UZAK, uzun ve net bir kenar).",
+            [("anchor", "Bu noktadan baslat"), ("free", "Baska kenar sec"), ("cancel", "Iptal")],
+            default="anchor")
+        if mode in (None, "cancel"):
+            return
+        family = "auto" if choice in ("auto", "later") else choice
+        self.start_helper_capture(family, anchor_label=label if mode == "anchor" else None,
+                                  defer_family=(choice == "later"))
+
+    def start_helper_capture(self, family, anchor_label=None, defer_family=False):
+        if self.pil_img is None:
+            messagebox.showinfo("Bilgi", "Once bir fotograf acin.")
+            return
+        # Diger tiklama modlariyla KARISMASIN - ayri, acik bir durum.
+        if self.edge_mode:
+            self.toggle_edge_mode()
+        if self.line_calib_mode:
+            self.toggle_line_calib_mode()
+        pts, sigmas, srcs = [], [], []
+        if anchor_label:
+            p = next((q for q in self.points if q["label"] == anchor_label), None)
+            if p is None:
+                return
+            pts.append((p["x"], p["y"]))
+            sigmas.append(point_sigma_px(p.get("source", "manual")))
+            srcs.append("anchor")
+        self.helper_capture = {"family": family, "anchor_label": anchor_label, "points": pts,
+                               "sigmas": sigmas, "srcs": srcs, "defer_family": defer_family}
+        self._helper_capture_status()
+        self._redraw()
+
+    def _helper_capture_status(self):
+        cap = self.helper_capture
+        if cap is None:
+            return
+        name = {"ab": "AB yonu", "ac": "AC yonu"}.get(cap["family"], "Yonu belirlenecek")
+        which = "ilk ucu" if not cap["points"] else "ikinci ucu"
+        self.status_var.set(f"{name} yardimci cizgisi: {which} secin  (Esc / sag tik: iptal)")
+
+    def cancel_helper_capture(self):
+        if self.helper_capture is None:
+            return
+        self.helper_capture = None
+        self.canvas.delete("helper_rubber")
+        self.status_var.set("Yardimci cizgi iptal edildi.")
+        self._redraw()
+
+    def _helper_capture_add_endpoint(self, x, y, source="manual"):
+        cap = self.helper_capture
+        if cap is None:
+            return
+        cap["points"].append((x, y))
+        cap["sigmas"].append(LINE_ENDPOINT_SIGMA_PX.get(source, 1.0))
+        cap["srcs"].append(source)
+        if len(cap["points"]) < 2:
+            self._helper_capture_status()
+            self._redraw()
+            return
+        self.helper_capture = None
+        self.canvas.delete("helper_rubber")
+        self._finalize_helper_capture(cap)
+
+    def _new_helper_id(self):
+        existing = {h["id"] for h in self.helper_lines}
+        while True:
+            self._helper_counter += 1
+            hid = f"HL{self._helper_counter}"
+            if hid not in existing:
+                return hid
+
+    def _finalize_helper_capture(self, cap):
+        p1, p2 = cap["points"]
+        if dist(p1, p2) < 15:
+            messagebox.showerror("Hata", "Yardimci cizgi cok kisa (en az ~15 piksel). Tekrar deneyin.")
+            self._redraw()
+            return
+        sig = math.sqrt(sum(s * s for s in cap["sigmas"]) / len(cap["sigmas"]))
+        clicked = [s for s in cap["srcs"] if s != "anchor"]
+        src = "manual_magnifier" if clicked and all(s == "manual_magnifier" for s in clicked) else "manual"
+        hl = {"id": self._new_helper_id(), "p1": [float(p1[0]), float(p1[1])], "p2": [float(p2[0]), float(p2[1])],
+              "family": cap["family"], "source": src, "anchor_label": cap["anchor_label"],
+              "point_labels": None, "verified": True, "endpoint_sigma_px": sig, "n_support": 2, "note": ""}
+        if self.helper_refine_var.get():
+            try:
+                gray = np.array(self.pil_img.convert("L"))
+                ref, why = refine_line_to_edge(gray, p1, p2)
+            except Exception as e:
+                ref, why = None, str(e)
+            if ref is not None:
+                hl.update({"p1": list(ref["p1"]), "p2": list(ref["p2"]), "source": "manual_refined",
+                           "endpoint_sigma_px": max(0.1, ref["rms_px"]), "n_support": ref["n_support"],
+                           "note": f"kenara oturtuldu (rms {ref['rms_px']:.2f} px, {ref['n_support']} ornek)"})
+            else:
+                hl["note"] = f"kenara oturtulmadi ({why}) - tiklanan konum kullanildi"
+        self._commit_helper_with_assessment(hl, defer_family=cap.get("defer_family", False))
+
+    def _make_point_pair_helper(self, family, labels):
+        lookup = {p["label"]: p for p in self.points}
+        pa, pb = lookup[labels[0]], lookup[labels[1]]
+        sig = math.sqrt((point_sigma_px(pa.get("source", "manual")) ** 2 +
+                         point_sigma_px(pb.get("source", "manual")) ** 2) / 2.0)
+        return {"id": f"P-{family.upper()}", "p1": [pa["x"], pa["y"]], "p2": [pb["x"], pb["y"]],
+                "family": family, "source": "point_pair", "anchor_label": None,
+                "point_labels": list(labels), "verified": True, "endpoint_sigma_px": sig,
+                "n_support": 2, "note": "eski yontem: iki nokta etiketiyle"}
+
+    @staticmethod
+    def _normalize_helper_line(d):
+        """JSON'dan gelen (ya da eksik alanli) bir kaydi guvenli bicime getirir."""
+        fam = d.get("family", "auto")
+        return {"id": str(d.get("id") or "HL?"), "p1": [float(d["p1"][0]), float(d["p1"][1])],
+                "p2": [float(d["p2"][0]), float(d["p2"][1])],
+                "family": fam if fam in ("ab", "ac", "auto") else "auto",
+                "source": d.get("source", "manual"), "anchor_label": d.get("anchor_label"),
+                "point_labels": d.get("point_labels"), "verified": bool(d.get("verified", True)),
+                "endpoint_sigma_px": float(d.get("endpoint_sigma_px", 1.0)),
+                "n_support": int(d.get("n_support", 2)), "note": d.get("note", "")}
+
+    def _helper_to_observation(self, hl):
+        o = LineObservation(tuple(hl["p1"]), tuple(hl["p2"]), source=hl.get("source", "manual"),
+                            verified=bool(hl.get("verified", True)), family=hl.get("family", "auto"),
+                            line_id=hl["id"], endpoint_sigma_px=float(hl.get("endpoint_sigma_px", 1.0)),
+                            n_support=int(hl.get("n_support", 2)))
+        hl["sigma_angle_deg"] = o.sigma_angle_deg
+        return o
+
+    def _sync_point_pair_helpers(self):
+        """Nokta-cifti (eski yontem) yardimci cizgileri etiketlerin GUNCEL
+        konumlarini izler; etiket artik yoksa bag koparilir (konum korunur)."""
+        lookup = {p["label"]: p for p in self.points}
+        for hl in self.helper_lines:
+            labels = hl.get("point_labels")
+            if not labels:
+                continue
+            if all(lb in lookup for lb in labels):
+                fresh = self._make_point_pair_helper(hl["family"] if hl["family"] in ("ab", "ac") else "ab", labels)
+                hl["p1"], hl["p2"] = fresh["p1"], fresh["p2"]
+                hl["endpoint_sigma_px"] = fresh["endpoint_sigma_px"]
+            else:
+                hl["point_labels"] = None
+                hl["source"] = "manual"
+                hl["note"] = "nokta etiketi artik yok; kenar konumu korundu"
+
+    def _on_legacy_helper_combo(self, family):
+        combos = self.abc_helper_ab_combos if family == "ab" else self.abc_helper_ac_combos
+        labels = [cb.get() for cb in combos]
+        hid = f"P-{family.upper()}"
+        had = any(h["id"] == hid for h in self.helper_lines)
+        self.helper_lines = [h for h in self.helper_lines if h["id"] != hid]
+        lookup = {p["label"] for p in self.points}
+        if all(labels) and labels[0] != labels[1] and all(lb in lookup for lb in labels):
+            self._commit_helper_with_assessment(self._make_point_pair_helper(family, labels))
+        elif had:
+            self._vp_stage_cache = (None, None)
+            self._refresh_helper_tree()
+            self._try_auto_compute_plane()
+
+    def _current_abc_points(self):
+        labels = [cb.get() for cb in self.abc_combos]
+        if any(not lb for lb in labels) or len(set(labels)) != 3:
+            return None
+        lookup = {p["label"]: (p["x"], p["y"]) for p in self.points}
+        if not all(lb in lookup for lb in labels):
+            return None
+        return tuple(lookup[lb] for lb in labels)
+
+    def _current_abc_inputs(self):
+        """Referans girdileri gecerliyse (mesaj GOSTERMEDEN) sozluk, degilse None."""
+        if self.pil_img is None or self.ref_mode_var.get() != "abc2len":
+            return None
+        pts = self._current_abc_points()
+        if pts is None:
+            return None
+        labels = [cb.get() for cb in self.abc_combos]
+        A, B, C = pts
+        if triangle_min_angle_deg(A, B, C) < MIN_TRIANGLE_ANGLE_DEG:
+            return None
+        ab_m = self._peek_len(self.abc_len_entries[0])
+        ac_m = self._peek_len(self.abc_len_entries[1])
+        if ab_m is None or ac_m is None:
+            return None
+        if self.abc_right_angle_var.get():
+            angle_deg = 90.0
+        else:
+            try:
+                angle_deg = float(self.abc_angle_entry.get().strip().replace(",", "."))
+            except ValueError:
+                return None
+            if not (0 < angle_deg < 180):
+                return None
+        src = {p["label"]: p.get("source", "manual") for p in self.points}
+        return {"labels": labels, "A": A, "B": B, "C": C, "sources": [src[lb] for lb in labels],
+                "ab_m": ab_m, "ac_m": ac_m, "angle_deg": angle_deg}
+
+    def _get_auto_line_observations(self):
+        """Otomatik cizgi gozlemleri (LSD/Hough + gradyan gucu + sigma),
+        fotograf basina bir kez hesaplanir."""
+        if self.pil_img is None:
+            return []
+        key = id(self.pil_img)
+        if getattr(self, "_auto_obs_cache_key", None) != key:
+            try:
+                self._auto_obs_cache = detect_line_observations(np.array(self.pil_img.convert("L")))
+            except Exception:
+                self._auto_obs_cache = []
+            self._auto_obs_cache_key = key
+        return self._auto_obs_cache[:AUTO_LINE_POOL_MAX]
+
+    def _build_family_observations(self, inputs, helpers=None):
+        """AB / AC aileleri icin gozlem havuzlari:
+          - referans A-B / A-C (dogrulanmis, metrigi de tanimlar)
+          - kullanicinin yardimci cizgileri (dogrulanmis, ailesi atanmis)
+          - olcum sorgusu kenarlari ve otomatik cizgiler (DOGRULANMAMIS; her
+            iki havuza da aday olarak girer - aile VP tutarliligiyla secilir)
+        Dogrulanmis bir cizgiyle ayni goruntu dogrusu uzerindeki otomatik
+        cizgiler (ör. referans kenarin kendisi) bagimsiz kanit olmadigi icin
+        atilir."""
+        A, B, C = inputs["A"], inputs["B"], inputs["C"]
+        sA, sB, sC = (point_sigma_px(s) for s in inputs["sources"])
+        ra = LineObservation(A, B, source="reference", verified=True, family="ab", line_id="REF-AB",
+                             is_reference=True, endpoint_sigma_px=math.sqrt((sA * sA + sB * sB) / 2.0))
+        rc = LineObservation(A, C, source="reference", verified=True, family="ac", line_id="REF-AC",
+                             is_reference=True, endpoint_sigma_px=math.sqrt((sA * sA + sC * sC) / 2.0))
+        obs_ab, obs_ac, verified_lines = [ra], [rc], [ra, rc]
+        self._sync_point_pair_helpers()
+        for hl in (self.helper_lines if helpers is None else helpers):
+            if hl.get("family") not in ("ab", "ac"):
+                continue
+            o = self._helper_to_observation(hl)
+            (obs_ab if hl["family"] == "ab" else obs_ac).append(o)
+            verified_lines.append(o)
+
+        lookup = {p["label"]: p for p in self.points}
+        for q in self.queries:
+            path = [q.get("a"), q.get("b")] + ([q["c"]] if q.get("c") else [])
+            for k in range(len(path) - 1):
+                pa, pb = lookup.get(path[k]), lookup.get(path[k + 1])
+                if pa is None or pb is None:
+                    continue
+                sig = math.sqrt((point_sigma_px(pa.get("source", "manual")) ** 2 +
+                                 point_sigma_px(pb.get("source", "manual")) ** 2) / 2.0)
+                o = LineObservation((pa["x"], pa["y"]), (pb["x"], pb["y"]), source="query_edge", verified=False,
+                                    line_id=f"Q:{q['name']}:{k}", endpoint_sigma_px=sig)
+                if o.length_px < 15 or any(helper_duplicates_reference(o.p1, o.p2, v.p1, v.p2, 1.0, 3.0)
+                                           for v in verified_lines):
+                    continue
+                obs_ab.append(o)
+                obs_ac.append(o)
+        for o in self._get_auto_line_observations():
+            tol = max(3.0, 3.0 * o.endpoint_sigma_px)
+            if any(helper_duplicates_reference(o.p1, o.p2, v.p1, v.p2, 1.0, tol) for v in verified_lines):
+                continue
+            obs_ab.append(o)
+            obs_ac.append(o)
+        return obs_ab, obs_ac
+
+    def _known_segments(self):
+        lookup = {p["label"]: (p["x"], p["y"]) for p in self.points}
+        out = []
+        for q in self.queries:
+            if q.get("ground_truth_m") and not q.get("c") and q["a"] in lookup and q["b"] in lookup:
+                out.append((lookup[q["a"]], lookup[q["b"]], q["ground_truth_m"]))
+        return out
+
+    def _vp_stage(self, A, obs_ab, obs_ac, img_size):
+        """VP asamasi uzunluklardan/acidan BAGIMSIZDIR - uzunluk kutusuna
+        yazarken her tus vurusunda yeniden hesaplanmasin diye onbellek."""
+        def sig(obs):
+            return tuple((o.line_id, round(o.p1[0], 3), round(o.p1[1], 3), round(o.p2[0], 3), round(o.p2[1], 3),
+                          o.verified, round(o.endpoint_sigma_px, 4), o.n_support) for o in obs)
+        key = (id(self.pil_img), sig(obs_ab), sig(obs_ac))
+        if self._vp_stage_cache[0] == key:
+            return self._vp_stage_cache[1]
+        stage = estimate_family_vps(obs_ab, obs_ac, A, img_size=img_size)
+        self._vp_stage_cache = (key, stage)
+        return stage
+
+    def _update_helper_status(self, stage):
+        self.helper_status = {}
+        if stage is not None:
+            for fam, f in stage["families"].items():
+                loo = {x["line_id"]: x for x in ((f.get("validation") or {}).get("loo", []))}
+                for lid, st in (f.get("line_status") or {}).items():
+                    if not st.get("verified") or lid.startswith("REF-"):
+                        continue
+                    entry = dict(st)
+                    entry["family"] = fam
+                    entry["loo_z"] = loo.get(lid, {}).get("z")
+                    self.helper_status[lid] = entry
+        self._refresh_helper_tree()
+
+    def _commit_helper_with_assessment(self, hl, defer_family=False):
+        """Yeni yardimci cizgiyi ONCE aday model olarak degerlendirir, eski
+        modelle karsilastirir; H_final ancak dogrulama kotulesmiyorsa ya da
+        kullanici ACIKCA kabul ederse degisir."""
+        msgs = []
+        pts = self._current_abc_points()
+        if pts:
+            A, B, C = pts
+            for rp, rq, nm in ((A, B, "A-B"), (A, C, "A-C")):
+                if helper_duplicates_reference(hl["p1"], hl["p2"], rp, rq):
+                    msgs.append(f"Not: bu yardimci cizgi referans cizgisiyle ({nm}) neredeyse ayni konumda. "
+                                f"Daha uzaktaki paralel bir kenar kacis noktasi tahminini daha fazla guclendirir.")
+        inputs = self._current_abc_inputs()
+        img_size = (self.pil_img.width, self.pil_img.height)
+
+        if hl["family"] == "auto" and not defer_family:
+            fam, zs = None, {}
+            if inputs is not None:
+                obs_ab, obs_ac = self._build_family_observations(inputs)
+                res = compute_metric_homography_from_observations(
+                    inputs["A"], inputs["B"], inputs["C"], inputs["ab_m"], inputs["ac_m"], inputs["angle_deg"],
+                    img_size=img_size, stage=self._vp_stage(inputs["A"], obs_ab, obs_ac, img_size))
+                fam, zs = suggest_line_family(self._helper_to_observation(hl), res)
+            if fam is not None:
+                hl["family"] = fam
+                hl["note"] = (hl.get("note", "") + " | yon VP tutarliligiyla onerildi").strip(" |")
+                msgs.append(f"Yon onerisi: {FAMILY_NAMES[fam]} (z_AB={zs['ab']:.1f}, z_AC={zs['ac']:.1f}). "
+                            f"Yanlissa listeden degistirebilirsiniz.")
+            else:
+                detail = (f"\n\nAB yonune sapma z={zs['ab']:.1f}, AC yonune z={zs['ac']:.1f} "
+                          f"(3'un alti tutarli).") if len(zs) == 2 else \
+                    "\n\n(Henuz perspektif modeli yok - once A/B/C ve uzunluklari tamamlayin.)"
+                c = self._choice_dialog("Yon belirsiz",
+                                        "Yardimci cizginin yonu belirsiz. AB veya AC olarak secin." + detail,
+                                        [("ab", "AB"), ("ac", "AC"), ("later", "Daha sonra")], default="later")
+                if c in ("ab", "ac"):
+                    hl["family"] = c
+
+        if hl["family"] not in ("ab", "ac") or inputs is None:
+            self.helper_lines.append(hl)
+            self._vp_stage_cache = (None, None)
+            self._refresh_helper_tree()
+            self._try_auto_compute_plane()
+            if hl["family"] not in ("ab", "ac"):
+                msgs.insert(0, f"{hl['id']} kaydedildi, ancak yonu atanmadi - hesaplamada KULLANILMIYOR. "
+                               f"Listeden AB/AC secin ya da 'Otomatik (oner)' deneyin.")
+            else:
+                msgs.insert(0, f"{hl['id']} ({FAMILY_NAMES[hl['family']]}) kaydedildi. Referans (A, B, C ve "
+                               f"uzunluklar) tamamlaninca perspektif hesabina katilacak.")
+            self.status_var.set(msgs[0])
+            if len(msgs) > 1:
+                messagebox.showinfo("Yardimci cizgi", "\n\n".join(msgs))
+            self._redraw()
+            return
+
+        obs_ab, obs_ac = self._build_family_observations(inputs)
+        new_obs = self._helper_to_observation(hl)
+        self.status_var.set("Yardimci cizgi degerlendiriliyor (onceki/sonraki model karsilastiriliyor)...")
+        self.update_idletasks()
+        a = assess_helper_addition(inputs["A"], inputs["B"], inputs["C"], inputs["ab_m"], inputs["ac_m"],
+                                   inputs["angle_deg"], obs_ab, obs_ac, new_obs, img_size=img_size,
+                                   known_segments=self._known_segments())
+        text = self._format_assessment(a, hl)
+        if msgs:
+            text += "\n\n" + "\n".join(msgs)
+        other = "ac" if hl["family"] == "ab" else "ab"
+        swap_lbl = f"Yonu {FAMILY_NAMES[other]} yap"
+        if a["verdict"] in ("accept", "accept_validated", "accept_unvalidated", "no_model"):
+            choice = self._choice_dialog("Yardimci cizgi", text,
+                                         [("keep", "Tamam"), ("swap", swap_lbl), ("delete", "Sil")], default="keep")
+        else:
+            choice = self._choice_dialog("Yardimci cizgi - tutarsizlik", text,
+                                         [("keep", "Yine de kullan"), ("swap", swap_lbl), ("delete", "Sil")],
+                                         default="delete")
+        if choice == "delete":
+            self.status_var.set(f"{hl['id']} eklenmedi; model degismedi.")
+            self._redraw()
+            return
+        if choice == "swap":
+            hl["family"] = other
+            hl["note"] = (hl.get("note", "") + " | yon kullanici tarafindan degistirildi").strip(" |")
+            self._commit_helper_with_assessment(hl)
+            return
+        if a["verdict"] not in ("accept", "accept_validated", "accept_unvalidated", "no_model"):
+            hl["note"] = (hl.get("note", "") + " | tutarsizliga ragmen kullanici kabul etti").strip(" |")
+        self.helper_lines.append(hl)
+        self._vp_stage_cache = (None, None)
+        self._recompute_plane(silent=True)
+        self._refresh_helper_tree()
+        self.status_var.set(f"{hl['id']} ({FAMILY_NAMES[hl['family']]}) eklendi ve modele katildi.")
+
+    def _format_assessment(self, a, hl):
+        fam = a["family"]
+        fn = FAMILY_NAMES[fam]
+        verdict_txt = {
+            "accept": "Mevcut modelle tutarli - model guncellendi.",
+            "accept_validated": ("Mevcut kanitla catisiyor, ancak BAGIMSIZ veri (diger yardimci cizgiler / "
+                                 "bilinen uzunluklar) yeni modeli destekliyor - model guncellendi."),
+            "accept_unvalidated": ("Onceden tam perspektif modeli yoktu; bu cizgiyle kuruldu. Karsilastirma "
+                                   "yapilamadi (bagimsiz dogrulama yok)."),
+            "inconsistent": f"[!] Bu cizgi mevcut {fn} dogrultusuyla tutarsiz gorunuyor.",
+            "worse": "[!] Bu cizgi dogrulama olcutlerini kotulestiriyor.",
+            "rejected_by_validation": (f"[!] Bu cizgi mevcut {fn} dogrultusuyla tutarsiz; bagimsiz veri ESKI "
+                                       f"modeli destekliyor."),
+            "no_model": "Bu cizgiyle de tam perspektif modeli kurulamiyor (diger yonde yeterli kanit yok).",
+        }[a["verdict"]]
+        src = self.HELPER_SOURCE_LABELS.get(hl.get("source"), hl.get("source"))
+        lines = [f"{fn} yardimci cizgisi {hl['id']} ({src})", verdict_txt]
+        if hl.get("note"):
+            lines.append(f"({hl['note']})")
+        if a["z_before"] is not None:
+            lines.append(f"Mevcut {fn} yonune sapma: {a['theta_before']:.2f}° (z={a['z_before']:.1f}; "
+                         f"3'un uzeri tutarsiz sayilir)")
+        b, af = a["before"], a["after"]
+
+        def f(x, fmt="{:.3f}"):
+            return fmt.format(x) if x is not None else "N/A"
+
+        def pct(x):
+            return f"%{x * 100:.1f}" if x is not None else "N/A"
+
+        if af is not None:
+            bb = b or {}
+            lines += ["",
+                      f"VP yon belirsizligi ({fn}):  once {f(bb.get(f'vp_unc_deg_{fam}'))}°  ->  "
+                      f"sonra {f(af[f'vp_unc_deg_{fam}'])}°",
+                      f"Bagimsiz aci kalintisi (hold-out RMS z):  once {f(bb.get(f'holdout_rms_z_{fam}'), '{:.2f}')}"
+                      f"  ->  sonra {f(af[f'holdout_rms_z_{fam}'], '{:.2f}')}",
+                      f"Uzamsal kapsama (dik yayilim):  once {pct(bb.get(f'spatial_{fam}'))}  ->  "
+                      f"sonra {pct(af[f'spatial_{fam}'])}",
+                      f"Uzak bolge olcek belirsizligi (1-sigma):  once {pct(bb.get('scale_unc_far'))}  ->  "
+                      f"sonra {pct(af['scale_unc_far'])}"]
+            if af.get("known_length_rel_err") is not None:
+                lines.append(f"Bilinen uzunluk hatasi:  once {pct(bb.get('known_length_rel_err'))}  ->  "
+                             f"sonra {pct(af['known_length_rel_err'])}")
+            lines.append(f"Guven:  once {bb.get('confidence', 'N/A')}  ->  sonra {af['confidence']}")
+        return "\n".join(lines)
+
+    def _refresh_helper_tree(self):
+        if not hasattr(self, "helper_tree"):
+            return
+        self.helper_tree.delete(*self.helper_tree.get_children())
+        for hl in self.helper_lines:
+            fam = FAMILY_NAMES.get(hl["family"], "?")
+            st = self.helper_status.get(hl["id"])
+            if hl["family"] not in ("ab", "ac"):
+                status = "yon atanmadi (kullanilmiyor)"
+            elif st is None:
+                status = "-"
+            elif not st.get("inlier", True):
+                status = f"[!] aykiri (z={st['z']:.1f}) kullanilmadi"
+            elif st.get("loo_z") is not None:
+                status = f"bagimsiz z={st['loo_z']:.1f}" + ("  [!] tutarsiz" if st["loo_z"] > VP_GATE_Z else "")
+            else:
+                status = f"z={st['z']:.1f} (bagimsiz dogrulama yok)"
+            self.helper_tree.insert("", "end", iid=hl["id"], values=(
+                hl["id"], fam, self.HELPER_SOURCE_LABELS.get(hl.get("source"), hl.get("source")),
+                hl.get("anchor_label") or "-", status))
+        if self._selected_helper_id and self.helper_tree.exists(self._selected_helper_id):
+            self.helper_tree.selection_set(self._selected_helper_id)
+
+    def _on_helper_tree_select(self, event=None):
+        sel = self.helper_tree.selection()
+        new = sel[0] if sel else None
+        if new != self._selected_helper_id:
+            self._selected_helper_id = new
+            self._redraw()
+
+    def _selected_helper(self):
+        sel = self.helper_tree.selection()
+        if not sel:
+            messagebox.showinfo("Bilgi", "Once listeden bir yardimci cizgi secin.")
+            return None
+        return next((h for h in self.helper_lines if h["id"] == sel[0]), None)
+
+    def delete_selected_helper(self):
+        hl = self._selected_helper()
+        if hl is None:
+            return
+        self.helper_lines = [h for h in self.helper_lines if h["id"] != hl["id"]]
+        if hl["id"] in ("P-AB", "P-AC"):
+            for cb in (self.abc_helper_ab_combos if hl["id"] == "P-AB" else self.abc_helper_ac_combos):
+                cb.set("")
+        self._selected_helper_id = None
+        self._vp_stage_cache = (None, None)
+        self._refresh_helper_tree()
+        self._try_auto_compute_plane()
+        self.status_var.set(f"{hl['id']} silindi.")
+
+    def set_selected_helper_family(self, family):
+        hl = self._selected_helper()
+        if hl is None or hl["family"] == family:
+            return
+        hl["family"] = family
+        hl["note"] = (hl.get("note", "") + " | yon kullanici tarafindan degistirildi").strip(" |")
+        self._vp_stage_cache = (None, None)
+        self._try_auto_compute_plane()
+        self._refresh_helper_tree()
+        self.status_var.set(f"{hl['id']} artik {FAMILY_NAMES[family]} yonunde.")
+
+    def suggest_selected_helper_family(self):
+        hl = self._selected_helper()
+        if hl is None:
+            return
+        inputs = self._current_abc_inputs()
+        if inputs is None:
+            messagebox.showinfo("Bilgi", "Oneri icin once referansi (A, B, C ve uzunluklar) tamamlayin.")
+            return
+        others = [h for h in self.helper_lines if h["id"] != hl["id"]]
+        img_size = (self.pil_img.width, self.pil_img.height)
+        obs_ab, obs_ac = self._build_family_observations(inputs, helpers=others)
+        res = compute_metric_homography_from_observations(
+            inputs["A"], inputs["B"], inputs["C"], inputs["ab_m"], inputs["ac_m"], inputs["angle_deg"],
+            obs_ab, obs_ac, img_size=img_size)
+        fam, zs = suggest_line_family(self._helper_to_observation(hl), res)
+        detail = (f"AB yonune sapma z={zs['ab']:.1f}, AC yonune z={zs['ac']:.1f}." if len(zs) == 2
+                  else "Diger kanitla perspektif modeli kurulamadi.")
+        if fam is None:
+            messagebox.showinfo("Yon belirsiz", "Yardimci cizginin yonu belirsiz. AB veya AC olarak secin.\n\n"
+                                                + detail)
+            return
+        c = self._choice_dialog("Yon onerisi", f"Oneri: {FAMILY_NAMES[fam]}.\n{detail}\n\nUygulansin mi?",
+                                [("yes", "Uygula"), ("no", "Vazgec")], default="yes")
+        if c == "yes":
+            self.set_selected_helper_family(fam)
+
+    def _draw_helper_lines(self, draw, sc, width=2, font=None, dash=10, gap=6):
+        cap = self.helper_capture
+        if cap is not None and cap["points"]:
+            x, y = sc(cap["points"][0])
+            col = HELPER_COLORS.get(cap["family"], HELPER_COLORS["auto"])
+            draw.ellipse([x - 6, y - 6, x + 6, y + 6], outline=col, width=3)
+        if not self.show_helpers_var.get():
+            return
+        for hl in self.helper_lines:
+            p, q = sc(hl["p1"]), sc(hl["p2"])
+            col = HELPER_COLORS.get(hl["family"], HELPER_COLORS["auto"])
+            st = self.helper_status.get(hl["id"]) or {}
+            bad = (st.get("inlier") is False) or (st.get("loo_z") is not None and st["loo_z"] > VP_GATE_Z)
+            w = width
+            if hl["id"] == self._selected_helper_id:
+                draw.line([p, q], fill=(255, 255, 255), width=width + 4)
+                w = width + 1
+            _draw_dashed_line(draw, p, q, col, w, dash, gap)
+            for e, other in ((p, q), (q, p)):
+                ux, uy = other[0] - e[0], other[1] - e[1]
+                n = math.hypot(ux, uy) or 1.0
+                tx, ty = -uy / n * 5 * w / 2, ux / n * 5 * w / 2
+                draw.line([(e[0] - tx, e[1] - ty), (e[0] + tx, e[1] + ty)], fill=col, width=w)
+            label = f"{FAMILY_NAMES.get(hl['family'], 'yonsuz')}-{hl['id']}" + (" !" if bad else "")
+            mid = ((p[0] + q[0]) / 2 + 6, (p[1] + q[1]) / 2 + 4)
+            draw.text(mid, label, fill=HELPER_WARN_COLOR if bad else col, font=font or self.font_small,
+                      stroke_width=2, stroke_fill=(0, 0, 0))
 
     # ---------- Kenar Hizalama (subpixel) ----------
 
@@ -5220,45 +7034,33 @@ class MeasureApp(tk.Tk):
                 return
         angle_rad = math.radians(angle_deg)
 
-        ref_scale = (math.hypot(B[0] - A[0], B[1] - A[1]) + math.hypot(C[0] - A[0], C[1] - A[1])) / 2.0
+        # YARDIMCI CIZGILER: tek veri modeli (self.helper_lines) - nokta
+        # akisiyla eklenenler, bagimsiz kenarlar ve eski nokta-cifti
+        # secimleri. Hepsi DOGRULANMIS gozlem olarak, referans A-B/A-C ve
+        # dogrulanmamis adaylarla (otomatik cizgiler, olcum kenarlari)
+        # birlikte gozlem-tabanli saglam VP kestiricisine girer.
+        inputs = {"labels": labels, "A": A, "B": B, "C": C,
+                  "sources": [lookup_source.get(lb, "manual") for lb in labels],
+                  "ab_m": ab_m, "ac_m": ac_m, "angle_deg": angle_deg}
+        obs_ab, obs_ac = self._build_family_observations(inputs)
+        img_size = (self.pil_img.width, self.pil_img.height) if self.pil_img is not None else None
+        vp_stage = self._vp_stage(A, obs_ab, obs_ac, img_size)
+        self._update_helper_status(vp_stage)
 
-        hab_labels = [cb.get() for cb in self.abc_helper_ab_combos]
-        hac_labels = [cb.get() for cb in self.abc_helper_ac_combos]
-        helper_ab = None
-        extra_ab = []
+        # Yedek (JOINT) rota icin eski bicimdeki girdiler - ayni yardimci cizgilerden.
+        helpers_ab = [(tuple(h["p1"]), tuple(h["p2"])) for h in self.helper_lines if h["family"] == "ab"]
+        helpers_ac = [(tuple(h["p1"]), tuple(h["p2"])) for h in self.helper_lines if h["family"] == "ac"]
+        helper_ab = helpers_ab[0] if helpers_ab else None
+        helper_ac = helpers_ac[0] if helpers_ac else None
+        extra_ab, extra_ac = helpers_ab[1:], helpers_ac[1:]
         ang_ab_ref = math.degrees(math.atan2(B[1] - A[1], B[0] - A[0]))
         ang_ac_ref = math.degrees(math.atan2(C[1] - A[1], C[0] - A[0]))
-        ang_hab, ang_hac = ang_ab_ref, ang_ac_ref  # helper yoksa referans kenarinin kendi acisina duser
-
-        if all(hab_labels) and len(set(hab_labels)) == 2 and all(lb in lookup for lb in hab_labels):
-            helper_ab = (lookup[hab_labels[0]], lookup[hab_labels[1]])
-            ang_hab = math.degrees(math.atan2(helper_ab[1][1] - helper_ab[0][1],
-                                               helper_ab[1][0] - helper_ab[0][0]))
-            # ONCE referans+yardimci TEK BASINA hangi kacis noktasini
-            # veriyor (baseline) bul - ek cizgileri DOGRU kritere (VP
-            # tutarliligi mi, aci yakinligi mi) gore toplayabilmek icin
-            # bu bilgi sart (bkz. _gather_extra_parallel_lines docstring).
-            base_kind_ab, base_vp_ab = _resolve_vanishing_point(A, B, helper_ab, None, ref_scale)
-            extra_ab = self._gather_extra_parallel_lines(lookup, base_kind_ab, base_vp_ab, ang_hab,
-                                                           [A, B, *helper_ab])
-        helper_ac = None
-        extra_ac = []
-        if all(hac_labels) and len(set(hac_labels)) == 2 and all(lb in lookup for lb in hac_labels):
-            helper_ac = (lookup[hac_labels[0]], lookup[hac_labels[1]])
-            ang_hac = math.degrees(math.atan2(helper_ac[1][1] - helper_ac[0][1],
-                                               helper_ac[1][0] - helper_ac[0][0]))
-            base_kind_ac, base_vp_ac = _resolve_vanishing_point(A, C, helper_ac, None, ref_scale)
-            extra_ac = self._gather_extra_parallel_lines(lookup, base_kind_ac, base_vp_ac, ang_hac,
-                                                           [A, C, *helper_ac])
-
-        # OTOMATIK CIZGI TESPITI: kullanici yardimci cizgi vermis olsa da
-        # olmasa da, fotograftan otomatik bulunan (LSD/Hough) aday
-        # cizgileri her iki yon icin de topla - bunlar RANSAC ile
-        # dogrulanip (bkz. _resolve_vanishing_point) sadece GERCEKTEN
-        # tutarli olanlar kullanilacak. Bu, Bolum 46'daki "kullanici ek
-        # tiklama yapmadan sistem otomatik cozsun" hedefini destekler.
-        auto_ab = self._gather_auto_lines_for_direction(ang_hab)
-        auto_ac = self._gather_auto_lines_for_direction(ang_hac)
+        auto_ab = self._gather_auto_lines_for_direction(ang_ab_ref)
+        auto_ac = self._gather_auto_lines_for_direction(ang_ac_ref)
+        if vp_stage.get("ambiguous_families"):
+            # Otomatik kanit belirsiz bulunduysa yedek rota da onu KULLANMAMALI
+            # (ayni yanlis kumeyi baska bir yoldan secebilir).
+            auto_ab, auto_ac = [], []
 
         world_A = (0.0, 0.0)
         world_B = (ab_m, 0.0)
@@ -5284,16 +7086,15 @@ class MeasureApp(tk.Tk):
         # baslangic tahmini, gercek olcum degil - durumu ACIKCA etiketle.
         self.plane_camera_status = "EXIF YAKLASIK" if K_exif is not None else "BILINMIYOR"
 
-        # ANA YONTEM (Bolum 3-13, tercih edilen): kademeli (stratified)
-        # PROJEKTIF->AFIN->METRIK rektifikasyon - bkz.
-        # compute_metric_homography_stratified modul dokumantasyonu. D,
-        # HICBIR ASAMADA kullanilmaz; metrik olcek (A,B,C'den, TAM/kesin)
-        # ve projektif duzeltme (kacis cizgisinden) ARTIK AYNI
-        # optimizasyon degiskenini PAYLASMAZ. Bu oturumda gercek sentetik
-        # benchmark'larda (bkz. tests/test_stratified_rectification.py)
-        # hem ESKI hem de asagidaki JOINT rotadan DAHA IYI olculdu.
-        self.plane_strat_result = compute_metric_homography_stratified(
-            A, B, C, ab_m, ac_m, angle_deg, helper_ab, helper_ac, extra_ab, extra_ac, auto_ab, auto_ac)
+        # ANA YONTEM: kademeli (stratified) PROJEKTIF->AFIN->METRIK
+        # rektifikasyon, gozlem tabanli (bkz.
+        # compute_metric_homography_from_observations): v_AB, v_AC belirsizlik-
+        # agirlikli ve dogrulanmis-kisitli saglam kestiriciden; l_inf = v_AB x
+        # v_AC; metrik olcek A,B,C'den TAM. D HICBIR ASAMADA girdi degildir.
+        # Karsilastirma olcumleri: tests/benchmark_helper_lines.py.
+        self.plane_strat_result = compute_metric_homography_from_observations(
+            A, B, C, ab_m, ac_m, angle_deg, img_size=img_size, stage=vp_stage,
+            known_segments=self._known_segments())
 
         # JOINT rota (bir onceki mimari - A,B,C VE yon kisitlarini TEK
         # sistemde cozer, kamera pozunu ek nokta olarak katabilir) SADECE
@@ -5325,29 +7126,7 @@ class MeasureApp(tk.Tk):
             self.plane_model_type = "projective"
             self.plane_d_route = "stratified"
 
-            def _fmt_deg(x):
-                return f"{x:.2f}°" if x is not None else "N/A"
-
-            def _fmt_unc(u):
-                return f"{u['angular_std_deg']:.2f}°" if u and u.get("angular_std_deg") is not None else "N/A"
-
-            ab_inf = abs(sr["v_ab_hom"][2]) < 1e-6
-            ac_inf = abs(sr["v_ac_hom"][2]) < 1e-6
-            self.plane_vp_confidence = "YUKSEK" if (sr["n_inliers_ab"] >= 3 and sr["n_inliers_ac"] >= 3) else "ORTA"
-            note = (
-                f"H, KADEMELI REKTIFIKASYON ile kuruldu (projektif->afin, kacis cizgisiyle; "
-                f"sonra afin->metrik, A/B/C'nin GERCEK uzunluklariyla TAM/kesin) - D* SADECE SONRADAN "
-                f"turetildi.\n"
-                f"AB yonu: {'SONSUZDA (tam paralel)' if ab_inf else 'sonlu'}, {sr['n_inliers_ab']} cizgi, "
-                f"afin-rekt. aci tutarliligi={_fmt_deg(sr['affine_residual_ab_deg'])}, "
-                f"yon belirsizligi={_fmt_unc(sr['v_ab_uncertainty'])}\n"
-                f"AC yonu: {'SONSUZDA (tam paralel)' if ac_inf else 'sonlu'}, {sr['n_inliers_ac']} cizgi, "
-                f"afin-rekt. aci tutarliligi={_fmt_deg(sr['affine_residual_ac_deg'])}, "
-                f"yon belirsizligi={_fmt_unc(sr['v_ac_uncertainty'])}\n"
-                f"AB/AC geri-kazanim (T_metric TAM olmali): "
-                f"{sr['ab_recovered']:.5f} (girdi {sr['ab_input']:.5f}), "
-                f"{sr['ac_recovered']:.5f} (girdi {sr['ac_input']:.5f})"
-            )
+            note = self._stratified_note(sr)
         elif global_result is not None:
             D_img = global_result["D_img"]
             img_pts = [A, B, C, D_img]
@@ -5429,6 +7208,8 @@ class MeasureApp(tk.Tk):
                     "sayiliyor, uzak bolgelerde hata buyuyebilir. DAHA DOGRU SONUC ICIN: asagidaki "
                     "'Daha Yuksek Dogruluk' bolumune, AB veya AC yonunde fotografta baska bir "
                     "yerde (ör. baska bir pencere kenari) gorunen bir kenarin 2 ucunu secin.")
+            for r in vp_stage.get("reasons", []):
+                note += "\n  - " + r
 
         try:
             if self.plane_strat_result is not None:
@@ -5502,6 +7283,48 @@ class MeasureApp(tk.Tk):
         self._redraw()
         if not silent:
             messagebox.showinfo("Duzlem hazir", note)
+
+    def _stratified_note(self, sr):
+        """Kademeli cozumun durum notu: guven ve BILESENLERI ayri ayri
+        (tek bir opak skor yerine), yetersiz kanit varsa somut oneri."""
+        self.plane_vp_confidence = sr["confidence"]
+        su = sr.get("scale_unc_far")
+        lines = ["H, KADEMELI REKTIFIKASYON ile kuruldu (kacis cizgisi -> afin -> metrik; olcek A/B/C'den "
+                 "TAM) - D* sadece SONRADAN turetildi.",
+                 f"Guven: {sr['confidence']}" +
+                 (f"  (uzak bolgelerde olcek belirsizligi ~%{su * 100:.1f}, 1-sigma)" if su is not None else "")]
+        suggest = []
+        for fam in ("ab", "ac"):
+            f = sr["families"][fam]
+            fn = FAMILY_NAMES[fam]
+            sp = f["spatial"] or {}
+            val = f.get("validation") or {}
+            loo = [x for x in val.get("loo", []) if x.get("z") is not None]
+            vtxt = []
+            if loo:
+                vtxt.append(f"yardimci LOO en buyuk z={max(x['z'] for x in loo):.1f}")
+            if val.get("cv_rms_z") is not None:
+                vtxt.append(f"otomatik CV RMS z={val['cv_rms_z']:.1f}")
+            unc = f["unc_deg"]
+            lines.append(f"{fn} yonu: {'SONSUZDA (paralel)' if f['is_infinite'] else 'sonlu VP'}, "
+                         f"{f['n_inliers']} cizgi (referans + {f['n_verified_helpers']} yardimci + "
+                         f"{f['n_unverified']} otomatik/diger), yon belirsizligi="
+                         f"{f'{unc:.2f}°' if unc is not None else 'N/A'}, dik yayilim=%"
+                         f"{sp.get('perp_span_frac', 0) * 100:.0f}, bagimsiz dogrulama: {', '.join(vtxt) or 'YOK'}")
+            if f["verified_outlier_ids"]:
+                lines.append(f"[!] {fn}: {', '.join(f['verified_outlier_ids'])} diger kanitla tutarsiz - "
+                             f"hesaba KATILMADI. Listeden silin ya da yonunu degistirin.")
+            if (sp.get("perp_span_frac", 0) < 0.15 or (unc is not None and unc > 0.5) or
+                    (not loo and val.get("cv_rms_z") is None)):
+                suggest.append(fn)
+        for r in sr.get("confidence_reasons", []):
+            lines.append(f"[!] {r}")
+        if suggest:
+            lines.append(f"Oneri: {' ve '.join(suggest)} yonunde, fotografin referanstan UZAK bir bolgesindeki "
+                         f"uzun ve net bir paralel kenari yardimci cizgi olarak ekleyin.")
+        lines.append(f"AB/AC geri-kazanim (T_metric TAM olmali): {sr['ab_recovered']:.5f} (girdi "
+                     f"{sr['ab_input']:.5f}), {sr['ac_recovered']:.5f} (girdi {sr['ac_input']:.5f})")
+        return "\n".join(lines)
 
     def _build_plane(self, labels, img_pts, world_pts, width_m, height_m, silent, calibrated, note):
         if world_pts is None:
@@ -5639,6 +7462,30 @@ class MeasureApp(tk.Tk):
             "camera_status": getattr(self, "plane_camera_status", "BILINMIYOR"),
             "line_residuals": getattr(self, "plane_line_residuals", None),
             "point_reproj": getattr(self, "plane_point_reproj", None),
+            **self._helper_evidence_snapshot(),
+        }
+
+    def _helper_evidence_snapshot(self):
+        """Bu duzlemi KURAN yardimci-cizgi kanitini (geometri, aile, kaynak,
+        guven), VP tahminlerini, belirsizligi ve dogrulama bilesenlerini
+        JSON-uyumlu olarak saklar. Kayitli duzlem yeniden yuklendiginde
+        dondurulmus H kullanilir - cizgiler yeniden TESPIT EDILMEZ."""
+        sr = self.plane_strat_result if getattr(self, "plane_d_route", None) == "stratified" else None
+        if sr is None:
+            return {"helper_lines": [], "vp": None, "vp_uncertainty_deg": None, "validation": None}
+        used = []
+        for hl in self.helper_lines:
+            if hl["family"] not in ("ab", "ac"):
+                continue
+            st = self.helper_status.get(hl["id"], {})
+            used.append({**self._normalize_helper_line(hl),
+                         "sigma_angle_deg": hl.get("sigma_angle_deg"),
+                         "inlier": st.get("inlier"), "z": st.get("z"), "loo_z": st.get("loo_z")})
+        return {
+            "helper_lines": used,
+            "vp": {"ab": [float(x) for x in sr["v_ab_hom"]], "ac": [float(x) for x in sr["v_ac_hom"]]},
+            "vp_uncertainty_deg": {"ab": sr["families"]["ab"]["unc_deg"], "ac": sr["families"]["ac"]["unc_deg"]},
+            "validation": summarize_model_validation(sr),
         }
 
     def _current_ref_label(self, corners):
@@ -5760,6 +7607,9 @@ class MeasureApp(tk.Tk):
                 self.plane_height_entry.insert(0, f"{from_meters(h, self.unit_var.get()):.4f}")
 
         note = f"'{p['name']}' KAYITLI duzlem yuklendi (kaydedildigi andaki kalibrasyon aynen kullaniliyor)."
+        if p.get("helper_lines"):
+            note += (f" Bu duzlem {len(p['helper_lines'])} yardimci cizgi kanitiyla kurulmustu; cizgiler "
+                     f"yeniden tespit edilmedi.")
         self._update_plane_status(note)
         self._redraw()
         self.status_var.set(f"'{p['name']}' duzlemi yuklendi.")
@@ -6153,8 +8003,14 @@ class MeasureApp(tk.Tk):
                     "mode": "abc2len", "labels": self.plane_corners,
                     "ab_m": self.plane_width_m, "ac_m": self.plane_height_m,
                     "angle_deg": angle_deg,
+                    # eski surumlerle uyumluluk icin hala yaziliyor; asil kaynak "helper_lines"
                     "helper_ab_labels": helper_ab_labels if all(helper_ab_labels) else None,
                     "helper_ac_labels": helper_ac_labels if all(helper_ac_labels) else None,
+                    # Kaydedilen kalibrasyonun AYNEN geri yuklenebilmesi icin
+                    "H_final": self.plane_H.tolist() if self.plane_H is not None else None,
+                    "model_type": getattr(self, "plane_model_type", None),
+                    "d_route": getattr(self, "plane_d_route", None),
+                    **self._helper_evidence_snapshot(),
                 }
 
         queries_out = [{**q, "plane_snapshot": self._snapshot_to_json(q.get("plane_snapshot"))}
@@ -6166,7 +8022,9 @@ class MeasureApp(tk.Tk):
             "pdf_page": self.pdf_page,
             "image_size": list(self.pil_img.size) if self.pil_img is not None else None,
             "ref_mode": self.ref_mode_var.get(),
-            "image_points": [{"label": p["label"], "x": p["x"], "y": p["y"]} for p in self.points],
+            "image_points": [{"label": p["label"], "x": p["x"], "y": p["y"],
+                              "source": p.get("source", "manual")} for p in self.points],
+            "helper_lines": [self._normalize_helper_line(h) for h in self.helper_lines],
             "queries": queries_out,
             "plane": plane_data,
             "saved_planes": saved_planes_out,
@@ -6228,8 +8086,20 @@ class MeasureApp(tk.Tk):
         self.ref_mode_var.set(cfg.get("ref_mode", "affine3"))
         self._apply_ref_mode()
 
-        self.points = [{"label": p["label"], "x": float(p["x"]), "y": float(p["y"])}
+        self.points = [{"label": p["label"], "x": float(p["x"]), "y": float(p["y"]),
+                        "source": p.get("source", "manual")}
                        for p in cfg.get("image_points", [])]
+        # "helper_lines" yoksa (eski config) bos liste - eski projeler bozulmaz.
+        self.helper_lines = []
+        for d in cfg.get("helper_lines") or []:
+            try:
+                self.helper_lines.append(self._normalize_helper_line(d))
+            except (KeyError, TypeError, ValueError, IndexError):
+                continue
+        nums = [int(h["id"][2:]) for h in self.helper_lines if h["id"].startswith("HL") and h["id"][2:].isdigit()]
+        self._helper_counter = max(nums) if nums else 0
+        self._vp_stage_cache = (None, None)
+        self._refresh_helper_tree()
         self.queries = [{**q, "plane_snapshot": self._snapshot_from_json(q.get("plane_snapshot"))}
                         for q in cfg.get("queries", [])]
         self.saved_planes = [self._snapshot_from_json(p) for p in cfg.get("saved_planes", [])]
@@ -6238,10 +8108,10 @@ class MeasureApp(tk.Tk):
         self._last_ref_label = None
         self._refresh_saved_planes_list()
 
+        restored_note = None
         plane = cfg.get("plane")
         if plane and plane.get("labels"):
             lookup = {p["label"]: (p["x"], p["y"]) for p in self.points}
-            lookup_source = {p["label"]: p.get("source", "manual") for p in self.points}
             labels = plane["labels"]
             mode = plane.get("mode", "quad4")
             if all(lb in lookup for lb in labels):
@@ -6287,128 +8157,11 @@ class MeasureApp(tk.Tk):
                         self.plane_axis1 = np.array(world_pts[1], dtype=np.float64) - self.plane_origin
                         self.plane_axis2 = np.array(world_pts[2], dtype=np.float64) - np.array(world_pts[1], dtype=np.float64)
                     else:
+                        # abc2len: arayuz alanlari doldurulur, sonra INTERAKTIF akisla
+                        # AYNI kod (_recompute_plane_abc2len) calisir - ikinci bir kopya yok.
                         ab_m, ac_m = plane["ab_m"], plane["ac_m"]
-                        angle_deg = plane.get("angle_deg", 90.0)
+                        angle_deg = plane.get("angle_deg") or 90.0
                         is_right_angle = abs(angle_deg - 90.0) < 1e-9
-                        angle_rad = math.radians(angle_deg)
-                        A_img, B_img, C_img = img_pts
-                        world_A = (0.0, 0.0)
-                        world_B = (ab_m, 0.0)
-                        world_C = (ac_m * math.cos(angle_rad), ac_m * math.sin(angle_rad))
-                        world_D = (world_B[0] + world_C[0], world_B[1] + world_C[1])
-
-                        helper_ab_labels = plane.get("helper_ab_labels")
-                        helper_ac_labels = plane.get("helper_ac_labels")
-                        helper_ab = (tuple(lookup[lb] for lb in helper_ab_labels)
-                                     if helper_ab_labels and all(lb in lookup for lb in helper_ab_labels) else None)
-                        helper_ac = (tuple(lookup[lb] for lb in helper_ac_labels)
-                                     if helper_ac_labels and all(lb in lookup for lb in helper_ac_labels) else None)
-                        ref_scale = (math.hypot(B_img[0] - A_img[0], B_img[1] - A_img[1]) +
-                                     math.hypot(C_img[0] - A_img[0], C_img[1] - A_img[1])) / 2.0
-                        extra_ab_l, extra_ac_l = [], []
-                        if helper_ab is not None:
-                            ang_hab = math.degrees(math.atan2(helper_ab[1][1] - helper_ab[0][1],
-                                                               helper_ab[1][0] - helper_ab[0][0]))
-                            base_kind_ab, base_vp_ab = _resolve_vanishing_point(
-                                A_img, B_img, helper_ab, None, ref_scale)
-                            extra_ab_l = self._gather_extra_parallel_lines(
-                                lookup, base_kind_ab, base_vp_ab, ang_hab, [A_img, B_img, *helper_ab])
-                        if helper_ac is not None:
-                            ang_hac = math.degrees(math.atan2(helper_ac[1][1] - helper_ac[0][1],
-                                                               helper_ac[1][0] - helper_ac[0][0]))
-                            base_kind_ac, base_vp_ac = _resolve_vanishing_point(
-                                A_img, C_img, helper_ac, None, ref_scale)
-                            extra_ac_l = self._gather_extra_parallel_lines(
-                                lookup, base_kind_ac, base_vp_ac, ang_hac, [A_img, C_img, *helper_ac])
-                        ang_ab_ref = math.degrees(math.atan2(B_img[1] - A_img[1], B_img[0] - A_img[0]))
-                        ang_ac_ref = math.degrees(math.atan2(C_img[1] - A_img[1], C_img[0] - A_img[0]))
-                        auto_ab_l = self._gather_auto_lines_for_direction(ang_hab if helper_ab is not None else ang_ab_ref)
-                        auto_ac_l = self._gather_auto_lines_for_direction(ang_hac if helper_ac is not None else ang_ac_ref)
-
-                        # Route A (kamera pozu) burada da - interaktif akisla
-                        # AYNI oncelikle: BAGIMSIZ bir dorduncu nokta GOZLEMI
-                        # olarak compute_global_homography'ye seed edilir
-                        # (bkz. Bolum 8/_recompute_plane_abc2len notu).
-                        img_w2 = self.pil_img.width if self.pil_img is not None else None
-                        img_h2 = self.pil_img.height if self.pil_img is not None else None
-                        K_exif2 = (estimate_camera_intrinsics_from_exif(getattr(self, "photo_exif", None), img_w2, img_h2)
-                                   if img_w2 and img_h2 else None)
-                        camera_pose_seed2 = (compute_fourth_point_camera_pose(A_img, B_img, C_img, K_exif2, ab_m, ac_m, angle_deg)
-                                              if K_exif2 is not None else None)
-                        self.plane_camera_status = "EXIF YAKLASIK" if K_exif2 is not None else "BILINMIYOR"
-
-                        # KADEMELI REKTIFIKASYON burada da - interaktif akisla
-                        # AYNI oncelikle (bkz. _recompute_plane_abc2len notu).
-                        strat_result2 = compute_metric_homography_stratified(
-                            A_img, B_img, C_img, ab_m, ac_m, angle_deg,
-                            helper_ab, helper_ac, extra_ab_l, extra_ac_l, auto_ab_l, auto_ac_l)
-                        self.plane_strat_result = strat_result2
-
-                        point_sources_abc2 = [lookup_source.get(labels[0], "manual"),
-                                              lookup_source.get(labels[1], "manual"),
-                                              lookup_source.get(labels[2], "manual")]
-                        global_result2 = None
-                        if strat_result2 is None:
-                            global_result2 = compute_global_homography(
-                                A_img, B_img, C_img, ab_m, ac_m, angle_deg,
-                                helper_ab, helper_ac, extra_ab_l, extra_ac_l,
-                                auto_ab_l, auto_ac_l, camera_pose_seed2,
-                                point_sources=point_sources_abc2,
-                                img_size=(img_w2, img_h2) if img_w2 and img_h2 else None)
-
-                        self.plane_vanishing_points = {"ab": None, "ac": None}
-                        self.plane_d_route = "affine_fallback"
-                        self.plane_line_residuals = {"ab": None, "ac": None}
-                        self.plane_point_reproj = None
-                        if strat_result2 is not None:
-                            D_img = strat_result2["D_img"]
-                            img_pts = [A_img, B_img, C_img, D_img]
-                            self.plane_H = strat_result2["H"]
-                            self.plane_Hinv = strat_result2["Hinv"]
-                            self.plane_model_type = "projective"
-                            self.plane_d_route = "stratified"
-                            self.plane_vp_confidence = ("YUKSEK" if (strat_result2["n_inliers_ab"] >= 3
-                                                         and strat_result2["n_inliers_ac"] >= 3) else "ORTA")
-                            self.plane_point_sources = ["manual", "manual", "manual", "derived_projective"]
-                        elif global_result2 is not None:
-                            D_img = global_result2["D_img"]
-                            k_ab, vp_ab = global_result2["kind_ab"], global_result2["vp_ab"]
-                            k_ac, vp_ac = global_result2["kind_ac"], global_result2["vp_ac"]
-                            used_cam2 = global_result2["used_camera_pose"]
-                            self.plane_H = global_result2["H"]
-                            self.plane_Hinv = global_result2["Hinv"]
-                            img_pts = [A_img, B_img, C_img, D_img]
-                            self.plane_vanishing_points = {"ab": (k_ab, vp_ab), "ac": (k_ac, vp_ac)}
-                            self.plane_model_type = "projective"
-                            self.plane_d_route = ("camera_pose" if used_cam2 and k_ab not in _FINITE_KINDS
-                                                   and k_ac not in _FINITE_KINDS else "vanishing_point")
-                            self.plane_line_residuals = {"ab": global_result2["line_residuals_ab"],
-                                                          "ac": global_result2["line_residuals_ac"]}
-                            self.plane_point_reproj = global_result2["point_reproj"]
-                            # SADECE kamera pozu (VP kaniti yok) ise Bolum 8
-                            # geregi guven en fazla ORTA olabilir.
-                            if k_ab in _FINITE_KINDS and k_ac in _FINITE_KINDS:
-                                self.plane_vp_confidence = ("YUKSEK" if k_ab == "finite_strong" and k_ac == "finite_strong"
-                                                             else "ORTA")
-                            elif k_ab in _FINITE_KINDS or k_ac in _FINITE_KINDS:
-                                self.plane_vp_confidence = "ORTA"
-                            else:
-                                self.plane_vp_confidence = "ORTA"
-                            self.plane_point_sources = ["manual", "manual", "manual", "derived_projective"]
-                        else:
-                            self.plane_H = fit_affine(img_pts, [world_A, world_B, world_C])
-                            self.plane_Hinv = np.linalg.inv(self.plane_H)
-                            self.plane_model_type = "affine_local"
-                            self.plane_vp_confidence = "N/A"
-                            self.plane_point_sources = ["manual", "manual", "manual"]
-                        self.plane_width_m = ab_m
-                        self.plane_height_m = ac_m
-                        self.plane_img_pts = [tuple(p) for p in img_pts]
-                        world_pts_for_cond = [world_A, world_B, world_C] + ([world_D] if len(img_pts) == 4 else [])
-                        self.plane_world_pts = [tuple(p) for p in world_pts_for_cond]
-                        cond_fn = homography_condition_number if len(img_pts) == 4 else affine_condition_number
-                        self.plane_condition_number = cond_fn(img_pts, world_pts_for_cond)
-                        self.plane_quality = classify_condition_quality(self.plane_condition_number)
                         for cb, lb in zip(self.abc_combos, labels):
                             cb.set(lb)
                         self.abc_len_entries[0].insert(0, f"{from_meters(ab_m, self.unit_var.get()):.4f}")
@@ -6416,17 +8169,34 @@ class MeasureApp(tk.Tk):
                         self.abc_right_angle_var.set(is_right_angle)
                         if not is_right_angle:
                             self.abc_angle_entry.insert(0, f"{angle_deg:.4f}")
-                        if helper_ab_labels:
-                            for cb, lb in zip(self.abc_helper_ab_combos, helper_ab_labels):
-                                cb.set(lb)
-                        if helper_ac_labels:
-                            for cb, lb in zip(self.abc_helper_ac_combos, helper_ac_labels):
-                                cb.set(lb)
-                        self.plane_corners = labels
-                        self.plane_calibrated = True
-                        self.plane_origin = np.array(world_A, dtype=np.float64)
-                        self.plane_axis1 = np.array(world_B, dtype=np.float64) - self.plane_origin
-                        self.plane_axis2 = np.array(world_C, dtype=np.float64) - self.plane_origin
+                        # ESKI config: helper_*_labels -> ayni veri modeline (nokta cifti).
+                        for fam, key, combos in (("ab", "helper_ab_labels", self.abc_helper_ab_combos),
+                                                 ("ac", "helper_ac_labels", self.abc_helper_ac_combos)):
+                            hl_labels = plane.get(key)
+                            if hl_labels and len(hl_labels) == 2 and all(lb in lookup for lb in hl_labels):
+                                for cb, lb in zip(combos, hl_labels):
+                                    cb.set(lb)
+                                if not any(h["id"] == f"P-{fam.upper()}" for h in self.helper_lines):
+                                    self.helper_lines.append(self._make_point_pair_helper(fam, hl_labels))
+                        self._vp_stage_cache = (None, None)
+                        self._recompute_plane_abc2len(silent=True)
+                        # Kayitli H_final varsa ve yeniden hesaplama FARKLI sonuc
+                        # veriyorsa (ör. farkli OpenCV surumu farkli otomatik cizgi
+                        # buldu), kaydedilen kalibrasyon AYNEN korunur.
+                        stored_H = plane.get("H_final")
+                        if stored_H is not None and self.plane_H is not None:
+                            Hs = np.array(stored_H, dtype=np.float64)
+                            Hs = Hs / Hs[2, 2]
+                            Hc = self.plane_H / self.plane_H[2, 2]
+                            if not np.allclose(Hs, Hc, rtol=1e-6, atol=1e-9):
+                                self.plane_H = Hs
+                                self.plane_Hinv = np.linalg.inv(Hs)
+                                if self.plane_img_pts and len(self.plane_img_pts) == 4 and self.plane_world_pts:
+                                    self.plane_img_pts[3] = tuple(apply_transform(self.plane_Hinv,
+                                                                                  self.plane_world_pts[3]))
+                                restored_note = ("Kayitli kalibrasyon (H_final) AYNEN geri yuklendi - mevcut "
+                                                 "kanitla yeniden hesaplama farkli sonuc veriyordu.")
+                        self._refresh_helper_tree()
 
                     if mode in ("affine3", "quad4"):
                         self.plane_corners = labels
@@ -6440,7 +8210,8 @@ class MeasureApp(tk.Tk):
         self.last_results = {}
         self._refresh_all_display()
         self._set_results_text("")
-        self.status_var.set(f"Config yuklendi: {os.path.basename(path)}")
+        self.status_var.set(f"Config yuklendi: {os.path.basename(path)}" +
+                            (f"  [{restored_note}]" if restored_note else ""))
 
     def save_annotated(self):
         if self.pil_img is None:
@@ -6475,6 +8246,10 @@ class MeasureApp(tk.Tk):
                 mid = ((mp1[0] + mp2[0]) / 2, (mp1[1] + mp2[1]) / 2)
                 draw.text(mid, f"{q['name']}: {self._fmt(self.last_results[q['name']])}", fill=QUERY_COLOR,
                           font=load_font(20), stroke_width=3, stroke_fill=(0, 0, 0))
+
+        line_w = max(3, full.size[0] // 800)
+        self._draw_helper_lines(draw, lambda pt: (pt[0], pt[1]), width=line_w, font=load_font(22),
+                                dash=6 * line_w, gap=4 * line_w)
 
         for p in self.points:
             x, y = p["x"], p["y"]
