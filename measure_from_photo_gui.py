@@ -4131,9 +4131,10 @@ class MeasureApp(tk.Tk):
         super().__init__()
         self.title("Fotograftan Uzunluk Olcumu")
         self.geometry("1500x900")
-        # Acilista soru sorulmaz: 2-fotograf modunun arayuzu henuz yok, bu yuzden
-        # dogrudan 1-fotograf modu (bkz. _prompt_measurement_mode - korunuyor).
-        self.measurement_mode = "single"
+        self.withdraw()  # mod secimi bitene kadar ana pencereyi GIZLE (Bolum A - "secim SONRASI yukle")
+        self.measurement_mode = self._prompt_measurement_mode()
+        self.title(f"Fotograftan Uzunluk Olcumu  [{('1 Fotograf' if self.measurement_mode=='single' else '2 Fotograf (henuz UI yok - 1 Fotograf kullaniliyor)')}]")
+        self.deiconify()
 
         self.pil_img = None
         self.pil_img_original = None
@@ -4176,14 +4177,6 @@ class MeasureApp(tk.Tk):
         self._selected_helper_id = None
         self._vp_stage_cache = (None, None)
         self._pan_press_xy = None
-
-        # Kolay mod (adim adim sihirbaz): "open" -> "A" -> "B" -> "C" ->
-        # "lengths" -> "measure". Gelismis paneller gizli; sorular yok.
-        self.easy_mode = True
-        self.advanced_visible = False
-        self.wizard_step = "open"
-        self.wizard_pending = None      # olcumde ilk tiklanan nokta
-        self._wizard_counter = 0
 
         self.unit_var = tk.StringVar(value="m")
         self.ref_mode_var = tk.StringVar(value="abc2len")
@@ -4273,39 +4266,26 @@ class MeasureApp(tk.Tk):
 
         toolbar = ttk.Frame(left)
         toolbar.pack(fill="x", pady=(0, 6))
-        self._toolbar_main = toolbar
         ttk.Button(toolbar, text="Fotograf / PDF Ac", command=self.open_photo).pack(side="left")
+        ttk.Button(toolbar, text="Son Noktayi Sil", command=self.undo_last_point).pack(side="left", padx=6)
         ttk.Label(toolbar, text="Birim:").pack(side="left", padx=(16, 2))
         unit_combo = ttk.Combobox(toolbar, textvariable=self.unit_var, values=list(UNITS.keys()),
                                    state="readonly", width=5)
         unit_combo.pack(side="left")
         unit_combo.bind("<<ComboboxSelected>>", self._on_unit_change)
         ttk.Button(toolbar, text="Sigdir", command=self.reset_view).pack(side="left", padx=(12, 0))
-        ttk.Button(toolbar, text="Netlestir", command=self.toggle_sharpen).pack(side="left", padx=(6, 0))
-        self.show_grid_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(toolbar, text="Izgara", variable=self.show_grid_var,
-                        command=self._redraw).pack(side="left", padx=(10, 0))
-        self.advanced_btn = ttk.Button(toolbar, text="Gelismis ▸", command=self.toggle_advanced)
-        self.advanced_btn.pack(side="right")
+        ttk.Button(toolbar, text="Netlestirmeyi Ac/Kapat", command=self.toggle_sharpen).pack(side="left", padx=(6, 0))
+        self.magnifier_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(toolbar, text="Buyutecli Nokta Ekleme", variable=self.magnifier_var).pack(
+            side="left", padx=(12, 0))
+        self.helper_prompt_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(toolbar, text="Noktadan sonra yardimci cizgi oner",
+                        variable=self.helper_prompt_var).pack(side="left", padx=(12, 0))
         self.status_var = tk.StringVar(value="Once bir fotograf acin.")
         ttk.Label(toolbar, textvariable=self.status_var, foreground="#555").pack(side="left", padx=12)
 
-        # Kolay mod talimat seridi (adim adim sihirbaz)
-        self._build_wizard_banner(left)
-
-        toolbar_adv = ttk.Frame(left)
-        self.easy_mode_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(toolbar_adv, text="Adim adim sihirbaz", variable=self.easy_mode_var,
-                        command=self._on_easy_mode_toggle).pack(side="left")
-        ttk.Button(toolbar_adv, text="Son Noktayi Sil", command=self.undo_last_point).pack(side="left", padx=(12, 0))
-        self.magnifier_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(toolbar_adv, text="Buyutecli Nokta Ekleme", variable=self.magnifier_var).pack(
-            side="left", padx=(12, 0))
-        self.helper_prompt_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(toolbar_adv, text="Noktadan sonra yardimci cizgi oner",
-                        variable=self.helper_prompt_var).pack(side="left", padx=(12, 0))
-
         toolbar2 = ttk.Frame(left)
+        toolbar2.pack(fill="x", pady=(0, 6))
         ttk.Label(toolbar2, text="Kontrast (sadece ekran gorunumu):").pack(side="left")
         self.contrast_var = tk.DoubleVar(value=1.0)
         contrast_scale = ttk.Scale(toolbar2, from_=0.5, to=2.5, orient="horizontal",
@@ -4317,6 +4297,7 @@ class MeasureApp(tk.Tk):
         ttk.Button(toolbar2, text="Kontrasti Sifirla", command=self._reset_contrast).pack(side="left", padx=(6, 0))
 
         toolbar_lens = ttk.Frame(left)
+        toolbar_lens.pack(fill="x", pady=(0, 6))
         ttk.Label(toolbar_lens, text="Lens Duzeltmesi (kavisli kenarlari duzler, ör. 0.5x genis acili fotolar):").pack(
             side="left")
         self.distortion_k_var = tk.DoubleVar(value=0.0)
@@ -4332,6 +4313,7 @@ class MeasureApp(tk.Tk):
             side="left", padx=(6, 0))
 
         toolbar_lens2 = ttk.Frame(left)
+        toolbar_lens2.pack(fill="x", pady=(0, 6))
         self.line_calib_btn = ttk.Button(toolbar_lens2, text="Duz Kenar Modu: KAPALI",
                                           command=self.toggle_line_calib_mode)
         self.line_calib_btn.pack(side="left")
@@ -4350,6 +4332,7 @@ class MeasureApp(tk.Tk):
                   foreground="#777").pack(side="left", padx=8)
 
         toolbar3 = ttk.Frame(left)
+        toolbar3.pack(fill="x", pady=(0, 6))
         self.edge_mode_btn = ttk.Button(toolbar3, text="Kenar Hizalama Modu: KAPALI",
                                          command=self.toggle_edge_mode)
         self.edge_mode_btn.pack(side="left")
@@ -4361,12 +4344,10 @@ class MeasureApp(tk.Tk):
                                   "gercek kenara subpixel hassasiyette oturtulur)",
                   foreground="#777").pack(side="left", padx=8)
 
-        self._adv_toolbars = [toolbar_adv, toolbar2, toolbar_lens, toolbar_lens2, toolbar3]
         hint = ttk.Label(left, text="Fare tekerlegi: yakinlastir/uzaklastir   |   Sag tik + surukle VEYA "
                                      "kenardaki kaydirma cubuklari: yukari/asagi/sag/sol kaydir",
                           foreground="#777")
         hint.pack(fill="x")
-        self._hint_label = hint
 
         canvas_frame = ttk.Frame(left)
         canvas_frame.pack(fill="both", expand=True)
@@ -4392,7 +4373,7 @@ class MeasureApp(tk.Tk):
 
         # --- Sag: scrollable panel ---
         right_container = ttk.Frame(main, width=460)
-        self.right_container = right_container
+        right_container.pack(side="left", fill="y", padx=(10, 0))
         right_container.pack_propagate(False)
 
         right_canvas = tk.Canvas(right_container, highlightthickness=0)
@@ -4921,9 +4902,21 @@ class MeasureApp(tk.Tk):
         self.pdf_page = None
         self.photo_exif = exif
         self.pil_img_original = img
-        # Soru sorulmaz; gerekirse "Netlestir" dugmesiyle acilir.
-        self.pil_img = img
-        self.sharpened = False
+        want_sharpen = messagebox.askyesno(
+            "Netlestirme",
+            "Fotografta net olmayan/bulanik bolgeler var mi?\n\n"
+            "Nokta secimini daha kolay/hassas yapabilmeniz icin "
+            "goruntuye keskinlik ve kontrast artirma uygulanabilir "
+            "(gercek bulaniklik giderilmez, ama kenarlar/detaylar "
+            "daha secilebilir hale gelir).\n\n"
+            "Netlestirmek ister misiniz?"
+        )
+        if want_sharpen:
+            self.pil_img = self._apply_sharpen(img)
+            self.sharpened = True
+        else:
+            self.pil_img = img
+            self.sharpened = False
         self._compute_display_scale()
         return True
 
@@ -5081,8 +5074,7 @@ class MeasureApp(tk.Tk):
         name = os.path.basename(path)
         if self.pdf_page is not None:
             name += f" (sayfa {self.pdf_page + 1})"
-        self.status_var.set(f"{name} yuklendi.")
-        self.wizard_start()
+        self.status_var.set(f"{name} yuklendi. Noktalari isaretlemek icin goruntuye tiklayin.")
 
     def _canvas_size(self):
         """Canvas'in GERCEK (o anki pencere boyutuna gore) genislik/
@@ -5299,8 +5291,7 @@ class MeasureApp(tk.Tk):
             # kullanildi).
             is_full_confidence = self.plane_calibrated and getattr(self, "plane_model_type", None) == "projective"
             grid_color = GRID_COLOR if is_full_confidence else PREVIEW_GRID_COLOR
-            if self.show_grid_var.get():
-                self._draw_grid(draw, sc, color=grid_color)
+            self._draw_grid(draw, sc, color=grid_color)
             if self.plane_corners:
                 pts = [lookup[c] for c in self.plane_corners if c in lookup]
                 if len(pts) == len(self.plane_corners):
@@ -5504,10 +5495,6 @@ class MeasureApp(tk.Tk):
                 self._helper_capture_add_endpoint(orig_x, orig_y, "manual")
             return
 
-        if self.easy_mode and not self.edge_mode and not self.line_calib_mode:
-            self._wizard_click(orig_x, orig_y)
-            return
-
         if self.edge_mode:
             self.edge_rough_points.append((orig_x, orig_y))
             self._redraw()
@@ -5690,335 +5677,6 @@ class MeasureApp(tk.Tk):
             self.plane_calibrated = False
             self.plane_status_var.set("Duzlem henuz ayarlanmadi (bir kose silindi).")
 
-    # ---------- Kolay mod: adim adim sihirbaz ----------
-    # Tek bir talimat seridi kullaniciyi yonlendirir; soru penceresi acilmaz.
-    # Arka planda AYNI hesaplama kodu (referans, yardimci cizgi, sorgu)
-    # kullanilir - sihirbaz sadece bir arayuz katmanidir.
-
-    WZ_BG = "#fff6d6"
-
-    def _build_wizard_banner(self, parent):
-        bg = self.WZ_BG
-        f = tk.Frame(parent, bg=bg, highlightthickness=1, highlightbackground="#e0c060")
-        f.pack(fill="x", pady=(0, 6))
-        self.wizard_frame = f
-        self.wizard_title = tk.Label(f, text="", bg=bg, font=("Segoe UI", 14, "bold"), anchor="w",
-                                     justify="left")
-        self.wizard_title.pack(fill="x", padx=10, pady=(6, 0))
-        self.wizard_sub = tk.Label(f, text="", bg=bg, fg="#444", font=("Segoe UI", 10), anchor="w",
-                                   justify="left", wraplength=950)
-        self.wizard_sub.pack(fill="x", padx=10, pady=(0, 4))
-
-        row = tk.Frame(f, bg=bg)
-        self.wizard_len_row = row
-        font = ("Segoe UI", 11)
-        tk.Label(row, text="A–B uzunlugu:", bg=bg, font=font).pack(side="left")
-        self.wz_ab = ttk.Entry(row, width=9, font=font)
-        self.wz_ab.pack(side="left", padx=(4, 12))
-        tk.Label(row, text="A–C uzunlugu:", bg=bg, font=font).pack(side="left")
-        self.wz_ac = ttk.Entry(row, width=9, font=font)
-        self.wz_ac.pack(side="left", padx=(4, 4))
-        self.wz_unit_lbl = tk.Label(row, textvariable=self.unit_var, bg=bg, font=font)
-        self.wz_unit_lbl.pack(side="left", padx=(0, 12))
-        self.wz_right_var = tk.BooleanVar(value=True)
-        tk.Checkbutton(row, text="A kosesi dik aci (90°)", variable=self.wz_right_var, bg=bg, font=font,
-                       activebackground=bg, command=self._wizard_angle_toggle).pack(side="left")
-        self.wz_angle = ttk.Entry(row, width=6, font=font, state="disabled")
-        self.wz_angle.pack(side="left", padx=(4, 12))
-        ttk.Button(row, text="Tamam", command=self._wizard_apply_lengths).pack(side="left")
-        for e in (self.wz_ab, self.wz_ac, self.wz_angle):
-            e.bind("<Return>", lambda ev: self._wizard_apply_lengths())
-
-        btns = tk.Frame(f, bg=bg)
-        self.wizard_btn_row = btns
-        self.wz_buttons = {
-            "undo": ttk.Button(btns, text="↶ Geri al", command=self._wizard_undo),
-            "edge_ab": ttk.Button(btns, text="Dogrulugu artir: A–B'ye paralel kenar ekle",
-                                  command=lambda: self._wizard_add_edge("ab")),
-            "edge_ac": ttk.Button(btns, text="Dogrulugu artir: A–C'ye paralel kenar ekle",
-                                  command=lambda: self._wizard_add_edge("ac")),
-            "lengths": ttk.Button(btns, text="Uzunluklari degistir", command=lambda: self._wizard_go("lengths")),
-            "cancel": ttk.Button(btns, text="Vazgec", command=self.cancel_helper_capture),
-            "restart": ttk.Button(btns, text="Bastan basla", command=self._wizard_restart),
-        }
-        self.wizard_go_pending = None
-        self._wizard_render("open")
-
-    def _wizard_render(self, step, title=None, sub=None, sub_color="#444"):
-        texts = {
-            "open": ("Baslamak icin bir fotograf veya PDF acin",
-                     "Ustteki 'Fotograf / PDF Ac' dugmesine basin."),
-            "A": ("Adim 1/4 — A kosesine tiklayin",
-                  "Uzunlugunu bildiginiz IKI kenarin birlestigi kose (ör. bir pencerenin sol alt kosesi). "
-                  "Hassas tiklamak icin fare tekerlegiyle yakinlastirin; sag tik + surukle ile kaydirin."),
-            "B": ("Adim 2/4 — B noktasina tiklayin",
-                  "A'dan cikan BIRINCI kenarin diger ucu (ör. pencerenin sag alt kosesi)."),
-            "C": ("Adim 3/4 — C noktasina tiklayin",
-                  "A'dan cikan IKINCI kenarin diger ucu (ör. pencerenin sol ust kosesi)."),
-            "lengths": ("Adim 4/4 — Gercek uzunluklari yazin",
-                        "Bu iki kenarin gercek uzunluklarini yazip Tamam'a (ya da Enter'a) basin."),
-            "measure": ("Olcmek istediginiz iki noktaya tiklayin", ""),
-            "edge": ("Kenarin iki ucuna tiklayin", ""),
-        }
-        t, s_ = texts.get(step, ("", ""))
-        self.wizard_title.config(text=title if title is not None else t)
-        self.wizard_sub.config(text=sub if sub is not None else s_, fg=sub_color)
-        self.wizard_len_row.pack_forget()
-        self.wizard_btn_row.pack_forget()
-        if step == "lengths":
-            self.wizard_len_row.pack(fill="x", padx=10, pady=(0, 6))
-        visible = {"open": [], "A": [], "B": ["undo", "restart"], "C": ["undo", "restart"],
-                   "lengths": ["undo", "restart"], "measure": ["undo", "edge_ab", "edge_ac", "lengths", "restart"],
-                   "edge": ["cancel"]}.get(step, [])
-        for key, b in self.wz_buttons.items():
-            b.pack_forget()
-        for key in visible:
-            self.wz_buttons[key].pack(side="left", padx=(0, 6))
-        if visible:
-            self.wizard_btn_row.pack(fill="x", padx=10, pady=(0, 8))
-
-    def _wizard_go(self, step):
-        self.wizard_step = step
-        self.wizard_pending = None
-        if step == "lengths":
-            for e, src in ((self.wz_ab, self.abc_len_entries[0]), (self.wz_ac, self.abc_len_entries[1])):
-                if not e.get().strip() and src.get().strip():
-                    e.insert(0, src.get().strip())
-            self._wizard_render("lengths")
-            self.wz_ab.focus_set()
-        elif step == "measure":
-            self._wizard_render("measure", sub=self._wizard_measure_text())
-        else:
-            self._wizard_render(step)
-        self._redraw()
-
-    def wizard_start(self):
-        self.wizard_pending = None
-        self._wizard_counter = 0
-        for e in (self.wz_ab, self.wz_ac):
-            e.delete(0, "end")
-        self._wizard_go("A" if self.pil_img is not None else "open")
-
-    def _wizard_sync(self):
-        """Config yukleme gibi disaridan gelen degisikliklerden sonra adimi belirler."""
-        if not self.easy_mode:
-            return
-        labels = {p["label"] for p in self.points}
-        if self.pil_img is None:
-            self._wizard_go("open")
-        elif self.plane_calibrated and self.plane_H is not None:
-            self._wizard_go("measure")
-        elif "A" not in labels:
-            self._wizard_go("A")
-        elif "B" not in labels:
-            self._wizard_go("B")
-        elif "C" not in labels:
-            self._wizard_go("C")
-        else:
-            self._wizard_go("lengths")
-
-    def _wizard_put_point(self, label, x, y):
-        self.points = [p for p in self.points if p["label"] != label]
-        self.points.append({"label": label, "x": x, "y": y, "source": "manual"})
-        self._refresh_all_display()
-
-    def _wizard_remove_point(self, label):
-        if any(p["label"] == label for p in self.points):
-            self.points = [p for p in self.points if p["label"] != label]
-            self._remove_references_to(label)
-            self._refresh_all_display()
-
-    def _wizard_click(self, x, y):
-        st = self.wizard_step
-        if st in ("A", "B", "C"):
-            self._wizard_put_point(st, x, y)
-            if st == "C":
-                for cb, lb in zip(self.abc_combos, "ABC"):
-                    cb.set(lb)
-            self._wizard_go({"A": "B", "B": "C", "C": "lengths"}[st])
-        elif st == "lengths":
-            self._wizard_render("lengths", sub="Once uzunluklari yazip Tamam'a basin.", sub_color="#b00")
-        elif st == "measure":
-            if self.wizard_pending is None:
-                label = self._wizard_free_label()
-                self._wizard_put_point(label, x, y)
-                self.wizard_pending = label
-                self._wizard_render("measure", title="Simdi ikinci noktaya tiklayin",
-                                    sub="Iki nokta arasindaki gercek uzunluk hesaplanacak.")
-                self._redraw()
-            else:
-                first = self.wizard_pending
-                label = self._wizard_free_label()
-                self._wizard_put_point(label, x, y)
-                self.wizard_pending = None
-                self._wizard_add_measurement(first, label)
-
-    def _wizard_free_label(self):
-        used = {p["label"] for p in self.points}
-        k = 1
-        while f"M{k}" in used:
-            k += 1
-        return f"M{k}"
-
-    def _wizard_angle_toggle(self):
-        self.wz_angle.config(state="disabled" if self.wz_right_var.get() else "normal")
-        if not self.wz_right_var.get():
-            self.wz_angle.focus_set()
-
-    def _wizard_apply_lengths(self):
-        def parse(e):
-            try:
-                v = float(e.get().strip().replace(",", "."))
-            except ValueError:
-                return None
-            return v if v > 0 else None
-        ab, ac = parse(self.wz_ab), parse(self.wz_ac)
-        if ab is None or ac is None:
-            self._wizard_render("lengths", sub="Iki kutuya da pozitif bir sayi yazin (ör. 1.20).", sub_color="#b00")
-            return
-        right = self.wz_right_var.get()
-        angle = None
-        if not right:
-            angle = parse(self.wz_angle)
-            if angle is None or angle >= 180:
-                self._wizard_render("lengths", sub="A kosesindeki aciyi 0-180 derece arasinda yazin.",
-                                    sub_color="#b00")
-                return
-        if self.ref_mode_var.get() != "abc2len":
-            # (ör. ref_mode alani olmayan eski bir config 'affine3' birakmis olabilir)
-            self.ref_mode_var.set("abc2len")
-            self._apply_ref_mode()
-        for cb, lb in zip(self.abc_combos, "ABC"):
-            cb.set(lb)
-        for dst, val in ((self.abc_len_entries[0], ab), (self.abc_len_entries[1], ac)):
-            dst.delete(0, "end")
-            dst.insert(0, f"{val}")
-        self.abc_right_angle_var.set(right)
-        self.abc_angle_entry.delete(0, "end")
-        if angle is not None:
-            self.abc_angle_entry.insert(0, f"{angle}")
-        self._recompute_plane(silent=True)
-        if not self.plane_calibrated or self.plane_H is None:
-            self._wizard_render("lengths", sub="Referans kurulamadi: A, B, C neredeyse ayni dogru uzerinde olabilir. "
-                                               "'Geri al' ile noktalari yeniden secin.", sub_color="#b00")
-            return
-        self._wizard_refresh_measurements()
-        self._wizard_go("measure")
-
-    def _wizard_add_measurement(self, la, lb):
-        snap = self._snapshot_current_plane()
-        if snap is None:
-            self._wizard_go("lengths")
-            return
-        snap["ref_label"] = self._current_ref_label(snap["corners"])
-        n = 1
-        names = {q["name"] for q in self.queries}
-        while f"Olcum {n}" in names:
-            n += 1
-        self.queries.append({"name": f"Olcum {n}", "a": la, "b": lb, "c": None, "ground_truth_m": None,
-                             "plane_snapshot": snap})
-        self._refresh_query_list()
-        self.compute()
-        self._wizard_go("measure")
-
-    def _wizard_refresh_measurements(self):
-        """Referans degisince (uzunluk, yardimci kenar) sihirbazdaki olcumler
-        guncel referansa tasinir ve yeniden hesaplanir."""
-        snap = self._snapshot_current_plane()
-        if snap is None or not self.queries:
-            return
-        snap["ref_label"] = self._current_ref_label(snap["corners"])
-        for q in self.queries:
-            q["plane_snapshot"] = dict(snap)
-        self._refresh_query_list()
-        self.compute()
-
-    def _wizard_measure_text(self):
-        lines = []
-        if self.plane_H is not None and self.plane_calibrated:
-            if getattr(self, "plane_model_type", None) == "projective":
-                conf = {"YUKSEK": "yuksek", "ORTA": "orta", "DUSUK": "dusuk"}.get(self.plane_vp_confidence,
-                                                                               self.plane_vp_confidence)
-                lines.append(f"Referans hazir - perspektif duzeltildi (guven: {conf}).")
-                if self.plane_vp_confidence != "YUKSEK":
-                    lines.append("Daha dogru sonuc icin: fotografin UZAK bir bolgesinde A–B'ye ya da A–C'ye "
-                                 "paralel, uzun ve net bir kenar ekleyin (asagidaki dugmeler).")
-            else:
-                lines.append("Referans hazir - ama perspektif bulunamadi; referanstan uzak olcumler hatali "
-                             "olabilir. Asagidaki dugmelerle A–B'ye ve A–C'ye paralel birer kenar ekleyin.")
-        results = [f"{q['name']}: {self._fmt(self.last_results[q['name']])}"
-                   for q in self.queries if q["name"] in self.last_results]
-        if results:
-            lines.append("Sonuclar:  " + "   |   ".join(results[-6:]))
-        return "\n".join(lines)
-
-    def _wizard_undo(self):
-        st = self.wizard_step
-        if st == "measure":
-            if self.wizard_pending is not None:
-                self._wizard_remove_point(self.wizard_pending)
-                self._wizard_go("measure")
-            elif self.queries:
-                q = self.queries.pop()
-                self.last_results.pop(q["name"], None)
-                for lb in (q["a"], q["b"]):
-                    if lb.startswith("M"):
-                        self._wizard_remove_point(lb)
-                self._refresh_query_list()
-                self._wizard_go("measure")
-            else:
-                self._wizard_go("lengths")
-        elif st == "lengths":
-            self._wizard_remove_point("C")
-            self._wizard_go("C")
-        elif st == "C":
-            self._wizard_remove_point("B")
-            self._wizard_go("B")
-        elif st == "B":
-            self._wizard_remove_point("A")
-            self._wizard_go("A")
-
-    def _wizard_restart(self):
-        if self.pil_img is None:
-            return
-        self._reset_state_for_new_photo()
-        self._refresh_all_display()
-        self.wizard_start()
-
-    def _wizard_add_edge(self, family):
-        name = "A–B" if family == "ab" else "A–C"
-        self.wizard_step = "edge"
-        self._wizard_render("edge", title=f"{name}'ye paralel bir kenarin iki ucuna tiklayin",
-                            sub=f"Gercekte {name} ile paralel, AYNI yuzeyde ve referanstan UZAK, uzun ve net bir "
-                                f"kenar secin (ör. cati hatti, pencere sirasi, bina kosesi). Esc: vazgec.")
-        self.start_helper_capture(family)
-
-    def _wizard_after_edge(self):
-        if self.easy_mode and self.wizard_step == "edge":
-            self._wizard_refresh_measurements()
-            self._wizard_go("measure" if self.plane_calibrated else "lengths")
-
-    def toggle_advanced(self):
-        self.advanced_visible = not self.advanced_visible
-        if self.advanced_visible:
-            for tb in self._adv_toolbars:
-                tb.pack(fill="x", pady=(0, 6), before=self._hint_label)
-            self.right_container.pack(side="left", fill="y", padx=(10, 0))
-            self.advanced_btn.config(text="Gelismis ◂ (gizle)")
-        else:
-            for tb in self._adv_toolbars:
-                tb.pack_forget()
-            self.right_container.pack_forget()
-            self.advanced_btn.config(text="Gelismis ▸")
-
-    def _on_easy_mode_toggle(self):
-        self.easy_mode = self.easy_mode_var.get()
-        if self.easy_mode:
-            self.wizard_frame.pack(fill="x", pady=(0, 6), after=self._toolbar_main)
-            self._wizard_sync()
-        else:
-            self.wizard_frame.pack_forget()
-
     # ---------- Yardimci cizgiler (nokta akisi + Daha Yuksek Dogruluk paneli) ----------
 
     HELPER_SOURCE_LABELS = {"manual": "elle", "manual_magnifier": "elle (buyutec)",
@@ -6143,7 +5801,6 @@ class MeasureApp(tk.Tk):
         self.canvas.delete("helper_rubber")
         self.status_var.set("Yardimci cizgi iptal edildi.")
         self._redraw()
-        self._wizard_after_edge()
 
     def _helper_capture_add_endpoint(self, x, y, source="manual"):
         cap = self.helper_capture
@@ -6173,7 +5830,6 @@ class MeasureApp(tk.Tk):
         if dist(p1, p2) < 15:
             messagebox.showerror("Hata", "Yardimci cizgi cok kisa (en az ~15 piksel). Tekrar deneyin.")
             self._redraw()
-            self._wizard_after_edge()
             return
         sig = math.sqrt(sum(s * s for s in cap["sigmas"]) / len(cap["sigmas"]))
         clicked = [s for s in cap["srcs"] if s != "anchor"]
@@ -6440,10 +6096,9 @@ class MeasureApp(tk.Tk):
                 msgs.insert(0, f"{hl['id']} ({FAMILY_NAMES[hl['family']]}) kaydedildi. Referans (A, B, C ve "
                                f"uzunluklar) tamamlaninca perspektif hesabina katilacak.")
             self.status_var.set(msgs[0])
-            if len(msgs) > 1 and not self.easy_mode:
+            if len(msgs) > 1:
                 messagebox.showinfo("Yardimci cizgi", "\n\n".join(msgs))
             self._redraw()
-            self._wizard_after_edge()
             return
 
         obs_ab, obs_ac = self._build_family_observations(inputs)
@@ -6458,9 +6113,7 @@ class MeasureApp(tk.Tk):
             text += "\n\n" + "\n".join(msgs)
         other = "ac" if hl["family"] == "ab" else "ab"
         swap_lbl = f"Yonu {FAMILY_NAMES[other]} yap"
-        if a["verdict"] in ("accept", "accept_validated", "accept_unvalidated", "no_model") and self.easy_mode:
-            choice = "keep"  # kolay mod: sorun yoksa soru sorma, sonucu seritte goster
-        elif a["verdict"] in ("accept", "accept_validated", "accept_unvalidated", "no_model"):
+        if a["verdict"] in ("accept", "accept_validated", "accept_unvalidated", "no_model"):
             choice = self._choice_dialog("Yardimci cizgi", text,
                                          [("keep", "Tamam"), ("swap", swap_lbl), ("delete", "Sil")], default="keep")
         else:
@@ -6470,7 +6123,6 @@ class MeasureApp(tk.Tk):
         if choice == "delete":
             self.status_var.set(f"{hl['id']} eklenmedi; model degismedi.")
             self._redraw()
-            self._wizard_after_edge()
             return
         if choice == "swap":
             hl["family"] = other
@@ -6484,7 +6136,6 @@ class MeasureApp(tk.Tk):
         self._recompute_plane(silent=True)
         self._refresh_helper_tree()
         self.status_var.set(f"{hl['id']} ({FAMILY_NAMES[hl['family']]}) eklendi ve modele katildi.")
-        self._wizard_after_edge()
 
     def _format_assessment(self, a, hl):
         fam = a["family"]
@@ -8569,7 +8220,6 @@ class MeasureApp(tk.Tk):
         self._set_results_text("")
         self.status_var.set(f"Config yuklendi: {os.path.basename(path)}" +
                             (f"  [{restored_note}]" if restored_note else ""))
-        self._wizard_sync()
 
     def save_annotated(self):
         if self.pil_img is None:
@@ -8586,8 +8236,7 @@ class MeasureApp(tk.Tk):
 
         if self.plane_H is not None and self.plane_calibrated:
             is_full_confidence = getattr(self, "plane_model_type", None) == "projective"
-            if self.show_grid_var.get():
-                self._draw_grid(draw, lambda pt: pt, color=(GRID_COLOR if is_full_confidence else PREVIEW_GRID_COLOR))
+            self._draw_grid(draw, lambda pt: pt, color=(GRID_COLOR if is_full_confidence else PREVIEW_GRID_COLOR))
             if self.plane_corners:
                 pts = [lookup[c] for c in self.plane_corners]
                 draw.line(pts + [pts[0]], fill=PLANE_COLOR, width=4)
